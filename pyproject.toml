@@ -12,15 +12,20 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "cuda-toolkit[cccl,nvcc]==13.0.3.0",
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
+    "flash-attn>=2.8.3",
+    "ninja",
     "xxhash",
 ]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
 
 [tool.setuptools.packages.find]
 where = ["."]

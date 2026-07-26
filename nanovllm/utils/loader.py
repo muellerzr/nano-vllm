@@ -26,3 +26,11 @@ def load_model(model: nn.Module, path: str):
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+
+
+def initialize_dummy_weights(model: nn.Module):
+    for name, param in model.named_parameters():
+        if name.endswith("weight_scale_inv"):
+            param.data.fill_(1)
+        else:
+            param.data.zero_()
