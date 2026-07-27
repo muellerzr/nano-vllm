@@ -219,26 +219,28 @@ def run_long_context(args) -> None:
         raise ValueError("--concurrency must be positive")
     os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
     os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
-    os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1" if args.mode == "compressed" else "0"
-    model_dir = args.config.parent / "minimal_model"
-    llm = LLM(
-        str(model_dir),
-        load_format="dummy",
-        tensor_parallel_size=args.world_size or 4,
-        max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=args.concurrency,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
-    )
     prompts = [make_prompt(args.input_tokens, config["vocab_size"]) for _ in range(args.concurrency)]
     params = SamplingParams(temperature=1.0, max_tokens=args.output_tokens, ignore_eos=True)
-    result = measure_generation(llm, prompts, params, args.warmup, args.iterations)
-    result.update({"mode": args.mode, "source_revision": source_revision(), "seed": args.seed,
-                   "world_size": args.world_size or 4, "warmup": args.warmup, "iterations": args.iterations,
-                   "config": str(args.config), "model": str(model_dir)})
-    print(json.dumps({"event": "long_context_result", **result}, sort_keys=True), flush=True)
-    llm.exit()
+    model_dir = args.config.parent / "minimal_model"
+    modes = ("baseline", "compressed") if args.mode == "both" else (args.mode,)
+    for mode in modes:
+        os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1" if mode == "compressed" else "0"
+        llm = LLM(
+            str(model_dir),
+            load_format="dummy",
+            tensor_parallel_size=args.world_size or 4,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.concurrency,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=True,
+        )
+        result = measure_generation(llm, prompts, params, args.warmup, args.iterations)
+        result.update({"mode": mode, "source_revision": source_revision(), "seed": args.seed,
+                       "world_size": args.world_size or 4, "warmup": args.warmup, "iterations": args.iterations,
+                       "config": str(args.config), "model": str(model_dir)})
+        print(json.dumps({"event": "long_context_result", **result}, sort_keys=True), flush=True)
+        llm.exit()
 
 
 def run(args) -> None:
