@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8, w8a8_triton_block_scaled_mm
 
+from nanovllm.layers.compressed_collective import all_reduce
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -153,7 +155,7 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            all_reduce(y)
         return y
 
 
@@ -288,5 +290,5 @@ class FP8RowParallelLinear(FP8LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.apply(x)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            all_reduce(y)
         return y
