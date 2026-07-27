@@ -6,7 +6,7 @@ from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.compressed_collective import all_reduce
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import NVFP4GroupedLinear, NVFP4QKVParallelLinear, NVFP4RowParallelLinear, ReplicatedLinear
+from nanovllm.layers.linear import NVFP4GroupedLinear, QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -24,14 +24,16 @@ class MiniMaxM2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_proj = NVFP4QKVParallelLinear(
+        # Published MiniMax deployment uses BF16 attention; only the MoE
+        # expert matrices are NVFP4.
+        self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
         )
-        self.o_proj = NVFP4RowParallelLinear(
+        self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
