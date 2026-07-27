@@ -9,6 +9,7 @@ import os
 import platform
 import socket
 import subprocess
+import uuid
 from time import perf_counter
 from pathlib import Path
 
@@ -226,7 +227,7 @@ def run_long_context(args) -> None:
         raise ValueError("--concurrency must be positive")
     os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
     os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
-    os.environ["NANOVLLM_SHM_NAME"] = f"nanovllm_{os.getpid()}"
+    os.environ["NANOVLLM_SHM_NAME"] = f"nanovllm_{os.getpid()}_{uuid.uuid4().hex}"
     prompts = [make_prompt(args.input_tokens, config["vocab_size"]) for _ in range(args.concurrency)]
     params = SamplingParams(temperature=1.0, max_tokens=args.output_tokens, ignore_eos=True)
     model_dir = args.config.parent / "minimal_model"
