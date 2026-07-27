@@ -1,10 +1,26 @@
 import torch
+import os
 from torch import nn
 import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+
+try:
+    import flashinfer
+except ImportError:
+    flashinfer = None
+
+_FLASHINFER_WORKSPACES = {}
+
+
+def _flashinfer_workspace(device):
+    workspace = _FLASHINFER_WORKSPACES.get(device)
+    if workspace is None:
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        _FLASHINFER_WORKSPACES[device] = workspace
+    return workspace
 
 
 @triton.jit
@@ -55,6 +71,10 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        backend = os.getenv("NANOVLLM_ATTENTION_BACKEND", "auto")
+        self.attention_backend = backend
+        self.flashinfer = flashinfer if backend in ("auto", "flashinfer") else None
+        self._decode_wrapper = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -69,7 +89,39 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            o = self._flashinfer_decode(q, k_cache, v_cache, context) if self.flashinfer is not None else None
+            if o is None:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True)
         return o
+
+    def _flashinfer_decode(self, q, k_cache, v_cache, context):
+        try:
+            page_size = k_cache.shape[1]
+            lengths = context.context_lens.detach().cpu().tolist()
+            indices = []
+            offsets = [0]
+            last_page_len = []
+            for row, length in zip(context.block_tables, lengths):
+                pages = (length + page_size - 1) // page_size
+                indices.append(row[:pages])
+                offsets.append(offsets[-1] + pages)
+                last_page_len.append((length - 1) % page_size + 1)
+            indptr = torch.tensor(offsets, dtype=torch.int32, device=q.device)
+            indices = torch.cat(indices).to(dtype=torch.int32)
+            last_page_len = torch.tensor(last_page_len, dtype=torch.int32, device=q.device)
+            if self._decode_wrapper is None:
+                self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    _flashinfer_workspace(q.device), kv_layout="NHD", use_tensor_cores=True
+                )
+            self._decode_wrapper.plan(
+                indptr, indices, last_page_len, self.num_heads, self.num_kv_heads, self.head_dim,
+                page_size, q_data_type=q.dtype, kv_data_type=k_cache.dtype, o_data_type=q.dtype,
+                sm_scale=self.scale,
+            )
+            return self._decode_wrapper.run(q, (k_cache, v_cache))
+        except (RuntimeError, ValueError):
+            if self.attention_backend == "flashinfer":
+                raise
+            return None
