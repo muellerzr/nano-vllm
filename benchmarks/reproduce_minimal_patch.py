@@ -33,7 +33,10 @@ def rank_max(value: float) -> float:
 
 def source_revision() -> str:
     root = Path(__file__).resolve().parents[1]
-    return subprocess.check_output(("git", "rev-parse", "HEAD"), cwd=root, text=True).strip()
+    try:
+        return subprocess.check_output(("git", "rev-parse", "HEAD"), cwd=root, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "container-source"
 
 
 def seed_weights(model: torch.nn.Module, seed: int) -> None:
