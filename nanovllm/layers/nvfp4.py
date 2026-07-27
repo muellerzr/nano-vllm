@@ -112,6 +112,7 @@ def grouped_nvfp4_mm_kernel(x, weight, x_scales, weight_scales, x_global_scales,
              mask=offsets_m[:, None] < group_size)
 
 
+@torch.compiler.disable
 def grouped_nvfp4_mm(x, weight, x_scales, weight_scales, x_global_scales,
                      weight_global_scales, expert_ids, group_sizes):
     groups, m, packed_k = x.shape
@@ -131,6 +132,7 @@ def grouped_nvfp4_mm(x, weight, x_scales, weight_scales, x_global_scales,
     return output
 
 
+@torch.compiler.disable
 def nvfp4_mm(x, weight, x_scales, weight_scales, x_global_scale, weight_global_scale):
     return F.scaled_mm(
         x, weight.t(), [x_scales, x_global_scale],
