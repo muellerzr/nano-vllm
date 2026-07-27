@@ -2,6 +2,7 @@
 """Reproduce stock vs FP8-collective NanoVLLM timings with synthetic weights."""
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -168,9 +169,12 @@ def make_prompt(length: int, vocab_size: int) -> list[int]:
     return [(17 * i + 3) % vocab_size for i in range(length)]
 
 
-def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: int) -> dict:
-    def once():
-        for prompt in prompts:
+def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: int, vocab_size: int) -> dict:
+    def once(salt: int):
+        # Prefix caching is disabled in the vLLM protocol.  Nano's block
+        # manager hashes blocks, so every sample gets a distinct first block.
+        run_prompts = [[(token + salt) % vocab_size for token in prompt] for prompt in prompts]
+        for prompt in run_prompts:
             llm.add_request(prompt, sampling_params)
         prefill_seconds = decode_seconds = 0.0
         prefill_tokens = decode_tokens = 0
@@ -187,9 +191,9 @@ def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: i
                 decode_seconds += elapsed
         return perf_counter() - start, prefill_tokens, prefill_seconds, decode_tokens, decode_seconds
 
-    for _ in range(warmup):
-        once()
-    samples = [once() for _ in range(iterations)]
+    for index in range(warmup):
+        once(7919 + index)
+    samples = [once(100000 + index) for index in range(iterations)]
     wall = sum(x[0] for x in samples) / iterations
     prefill_s = sum(x[2] for x in samples) / iterations
     decode_s = sum(x[4] for x in samples) / iterations
@@ -235,12 +239,15 @@ def run_long_context(args) -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             enforce_eager=True,
         )
-        result = measure_generation(llm, prompts, params, args.warmup, args.iterations)
+        result = measure_generation(llm, prompts, params, args.warmup, args.iterations, config["vocab_size"])
         result.update({"mode": mode, "source_revision": source_revision(), "seed": args.seed,
                        "world_size": args.world_size or 4, "warmup": args.warmup, "iterations": args.iterations,
                        "config": str(args.config), "model": str(model_dir)})
         print(json.dumps({"event": "long_context_result", **result}, sort_keys=True), flush=True)
         llm.exit()
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def run(args) -> None:
