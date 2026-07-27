@@ -2,9 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8, w8a8_triton_block_scaled_mm
 
 from nanovllm.layers.compressed_collective import all_reduce
+from nanovllm.layers.fp8 import per_token_group_quant_fp8, w8a8_triton_block_scaled_mm
 
 
 def divide(numerator, denominator):
