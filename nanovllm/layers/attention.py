@@ -88,7 +88,7 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            o = self._flashinfer_prefill(q, k, v, context) if self.flashinfer is not None and context.block_tables is None else None
+            o = self._flashinfer_prefill(q, k, v, context) if self.flashinfer is not None else None
             if o is None:
                 if flash_attn_varlen_func is None:
                     raise RuntimeError("FlashInfer is required when flash-attn is unavailable")
@@ -129,9 +129,7 @@ class Attention(nn.Module):
                 sm_scale=self.scale,
             )
             return self._decode_wrapper.run(q, (k_cache, v_cache))
-        except Exception as exc:
-            if os.getenv("NANOVLLM_DEBUG_ATTENTION") == "1":
-                print(f"FlashInfer decode fallback: {type(exc).__name__}: {exc}", flush=True)
+        except Exception:
             if self.attention_backend == "flashinfer":
                 raise
             return None
@@ -172,9 +170,7 @@ class Attention(nn.Module):
                 kv_data_type=self.k_cache.dtype, o_data_type=q.dtype,
             )
             return self._prefill_wrapper.run(q, (self.k_cache, self.v_cache))
-        except Exception as exc:
-            if os.getenv("NANOVLLM_DEBUG_ATTENTION") == "1":
-                print(f"FlashInfer prefill fallback: {type(exc).__name__}: {exc}", flush=True)
+        except Exception:
             if self.attention_backend == "flashinfer":
                 raise
             return None
