@@ -38,11 +38,12 @@ class MiniMaxM2Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.q_size, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.kv_size, eps=config.rms_norm_eps)
+        rope_params = getattr(config, "rope_parameters", {}) or {}
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=config.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=getattr(config, "rope_theta", rope_params.get("rope_theta", 10000)),
         )
         self.attn = Attention(
             self.num_heads,
