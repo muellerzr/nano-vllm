@@ -4,8 +4,9 @@ import torch.distributed as dist
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
+from nanovllm.layers.compressed_collective import all_reduce
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import FP8QKVParallelLinear, FP8MergedColumnParallelLinear, FP8RowParallelLinear, ReplicatedLinear
+from nanovllm.layers.linear import NVFP4GroupedLinear, NVFP4QKVParallelLinear, NVFP4RowParallelLinear, ReplicatedLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -23,14 +24,14 @@ class MiniMaxM2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_proj = FP8QKVParallelLinear(
+        self.qkv_proj = NVFP4QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
         )
-        self.o_proj = FP8RowParallelLinear(
+        self.o_proj = NVFP4RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
@@ -65,26 +66,6 @@ class MiniMaxM2Attention(nn.Module):
         return self.o_proj(o.flatten(1, -1))
 
 
-class MiniMaxM2MLP(nn.Module):
-
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.w1_w3 = FP8MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size] * 2,
-            bias=False,
-        )
-        self.w2 = FP8RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        return self.w2(self.act_fn(self.w1_w3(x)))
-
-
 class MiniMaxM2SparseMoeBlock(nn.Module):
 
     def __init__(self, config) -> None:
@@ -92,7 +73,10 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
         self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([MiniMaxM2MLP(config) for _ in range(self.num_experts)])
+        tp_size = dist.get_world_size()
+        self.w1_w3 = NVFP4GroupedLinear(self.num_experts, config.hidden_size, config.intermediate_size * 2 // tp_size)
+        self.w2 = NVFP4GroupedLinear(self.num_experts, config.intermediate_size // tp_size, config.hidden_size)
+        self.act_fn = SiluAndMul()
         self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts))
 
     def forward(self, hidden_states):
@@ -102,12 +86,26 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         top_k_index = torch.topk(scores, self.top_k, dim=-1, sorted=False).indices
         top_k_weights = routing_weights.gather(1, top_k_index)
         top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+        active_experts = top_k_index.unique()
+        assignments = [torch.where(top_k_index == expert_idx) for expert_idx in active_experts]
+        max_tokens = max(token_idx.numel() for token_idx, _ in assignments)
+        padded_tokens = (max_tokens + 127) // 128 * 128
+        grouped_input = torch.zeros(active_experts.numel(), padded_tokens, hidden_states.shape[-1],
+                                    dtype=hidden_states.dtype, device=hidden_states.device)
+        group_sizes = torch.tensor([token_idx.numel() for token_idx, _ in assignments], dtype=torch.int32,
+                                   device=hidden_states.device)
+        for group, (token_idx, _) in enumerate(assignments):
+            grouped_input[group, :token_idx.numel()] = hidden_states[token_idx]
+        expert_ids = active_experts.to(torch.int32)
+        grouped_output = self.w1_w3(grouped_input, expert_ids, group_sizes)
+        grouped_output = self.act_fn(grouped_output)
+        grouped_output = self.w2(grouped_output, expert_ids, group_sizes)
         output = torch.zeros_like(hidden_states)
-        for expert_idx in top_k_index.unique():
-            token_idx, slot_idx = torch.where(top_k_index == expert_idx)
-            x = hidden_states[token_idx]
-            y = self.experts[expert_idx](x)
+        for group, (token_idx, slot_idx) in enumerate(assignments):
+            y = grouped_output[group, :token_idx.numel()]
             output.index_add_(0, token_idx, y * top_k_weights[token_idx, slot_idx, None].to(y.dtype))
+        if dist.get_world_size() > 1:
+            all_reduce(output)
         return output
 
 

@@ -8,6 +8,7 @@ import os
 import platform
 import socket
 import subprocess
+from time import perf_counter
 from pathlib import Path
 
 import torch
@@ -16,6 +17,7 @@ from transformers import PretrainedConfig
 
 from nanovllm.layers.compressed_collective import all_reduce, reset_stats, stats
 from nanovllm.models.minimax_m2 import MiniMaxM2ForCausalLM
+from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.context import reset_context, set_context
 
 
@@ -143,6 +145,7 @@ def validate_collective(args) -> dict:
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", choices=("forward", "long-context"), default="forward")
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("minimal_minimax_m2_config.json"))
     parser.add_argument("--mode", choices=("baseline", "compressed", "both"), default="both")
     parser.add_argument("--warmup", type=int, default=5)
@@ -152,10 +155,96 @@ def parse_args():
     parser.add_argument("--min-bytes", type=int, default=3 * 1024 * 1024)
     parser.add_argument("--world-size", type=int)
     parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument("--input-tokens", type=int, default=10000)
+    parser.add_argument("--output-tokens", type=int, default=512)
+    parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     return parser.parse_args()
 
 
+def make_prompt(length: int, vocab_size: int) -> list[int]:
+    return [(17 * i + 3) % vocab_size for i in range(length)]
+
+
+def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: int) -> dict:
+    def once():
+        for prompt in prompts:
+            llm.add_request(prompt, sampling_params)
+        prefill_seconds = decode_seconds = 0.0
+        prefill_tokens = decode_tokens = 0
+        start = perf_counter()
+        while not llm.is_finished():
+            step_start = perf_counter()
+            _, scheduled = llm.step()
+            elapsed = perf_counter() - step_start
+            if scheduled > 0:
+                prefill_tokens += scheduled
+                prefill_seconds += elapsed
+            else:
+                decode_tokens += -scheduled
+                decode_seconds += elapsed
+        return perf_counter() - start, prefill_tokens, prefill_seconds, decode_tokens, decode_seconds
+
+    for _ in range(warmup):
+        once()
+    samples = [once() for _ in range(iterations)]
+    wall = sum(x[0] for x in samples) / iterations
+    prefill_s = sum(x[2] for x in samples) / iterations
+    decode_s = sum(x[4] for x in samples) / iterations
+    prompt_tokens = len(prompts) * len(prompts[0])
+    generated_tokens = len(prompts) * sampling_params.max_tokens
+    return {
+        "concurrency": len(prompts),
+        "input_tokens": len(prompts[0]),
+        "output_tokens": sampling_params.max_tokens,
+        "wall_ms": wall * 1000,
+        "prefill_ms": prefill_s * 1000,
+        "decode_ms": decode_s * 1000,
+        "prefill_tokens": prompt_tokens,
+        "decode_tokens": generated_tokens,
+        "prefill_tokens_per_second": prompt_tokens / prefill_s,
+        "decode_tokens_per_second": generated_tokens / decode_s,
+        "generated_tokens_per_second": generated_tokens / wall,
+        "generated_tokens_per_second_per_user": generated_tokens / len(prompts) / wall,
+    }
+
+
+def run_long_context(args) -> None:
+    from nanovllm import LLM
+
+    config = json.loads(args.config.read_text())
+    if args.concurrency < 1:
+        raise ValueError("--concurrency must be positive")
+    os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
+    os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
+    os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1" if args.mode == "compressed" else "0"
+    model_dir = args.config.parent / "minimal_model"
+    llm = LLM(
+        str(model_dir),
+        load_format="dummy",
+        tensor_parallel_size=args.world_size or 4,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.concurrency,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=True,
+    )
+    prompts = [make_prompt(args.input_tokens, config["vocab_size"]) for _ in range(args.concurrency)]
+    params = SamplingParams(temperature=1.0, max_tokens=args.output_tokens, ignore_eos=True)
+    result = measure_generation(llm, prompts, params, args.warmup, args.iterations)
+    result.update({"mode": args.mode, "source_revision": source_revision(), "seed": args.seed,
+                   "world_size": args.world_size or 4, "warmup": args.warmup, "iterations": args.iterations,
+                   "config": str(args.config), "model": str(model_dir)})
+    print(json.dumps({"event": "long_context_result", **result}, sort_keys=True), flush=True)
+    llm.exit()
+
+
 def run(args) -> None:
+    if args.profile == "long-context":
+        run_long_context(args)
+        return
     os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
     os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -200,6 +289,9 @@ def _spawn_rank(rank: int, world_size: int, args) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.profile == "long-context":
+        run(args)
+        return
     if "RANK" not in os.environ:
         world_size = args.world_size or torch.cuda.device_count()
         if world_size < 2:

@@ -30,7 +30,9 @@ def load_model(model: nn.Module, path: str):
 
 def initialize_dummy_weights(model: nn.Module):
     for name, param in model.named_parameters():
-        if name.endswith("weight_scale_inv"):
+        if param.dtype == torch.float4_e2m1fn_x2:
+            param.data.view(torch.uint8).zero_()
+        elif name.endswith("weight_scale_inv") or name.endswith("weight_global_scale"):
             param.data.fill_(1)
         else:
             param.data.zero_()

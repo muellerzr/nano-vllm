@@ -12,6 +12,16 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
+class _DummyTokenizer:
+    eos_token_id = 0
+
+    def encode(self, text):
+        return [0] * max(1, len(text.split()))
+
+    def decode(self, token_ids):
+        return "".join("<0>" for _ in token_ids)
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -29,14 +39,18 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = _DummyTokenizer() if config.load_format == "dummy" else AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        if getattr(self, "model_runner", None) is None:
+            return
+        model_runner = self.model_runner
+        self.model_runner = None
+        model_runner.call("exit")
+        del model_runner
         for p in self.ps:
             p.join()
 
