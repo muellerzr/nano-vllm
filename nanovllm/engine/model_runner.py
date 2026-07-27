@@ -1,4 +1,3 @@
-import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -34,8 +33,6 @@ class ModelRunner:
             initialize_dummy_weights(self.model)
         else:
             load_model(self.model, config.model)
-        if os.getenv("NANOVLLM_COMPILE", "0") == "1":
-            self.model = torch.compile(self.model, mode="max-autotune-no-cudagraphs", dynamic=True)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
