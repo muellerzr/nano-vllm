@@ -1,10 +1,11 @@
 import torch
+from nanovllm.utils.compile import compile_inner
 from torch import nn
 
 
 class Sampler(nn.Module):
 
-    @torch.compile
+    @compile_inner
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)

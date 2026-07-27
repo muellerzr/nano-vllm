@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.layers.compressed_collective import all_reduce
 from nanovllm.layers.fp8 import per_token_group_quant_fp8, w8a8_triton_block_scaled_mm
-from nanovllm.layers.nvfp4 import grouped_nvfp4_mm, nvfp4_mm, quant_nvfp4_fixed
+from nanovllm.layers.nvfp4 import nvfp4_mm, quant_nvfp4_fixed
 
 
 def divide(numerator, denominator):
@@ -53,6 +53,28 @@ class ReplicatedLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
+
+
+class VLLMRouterLinear(nn.Module):
+    """MiniMax GateLinear shell without vLLM's private TP-group state."""
+
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(output_size, input_size, dtype=torch.float32))
+        self.weight.weight_loader = self.weight_loader
+        try:
+            import vllm.model_executor.layers.fused_moe.router.gate_linear  # noqa: F401
+            self._dispatch = torch.ops.vllm.fp32_router_gemm_dispatch
+        except (ImportError, AttributeError):
+            self._dispatch = None
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._dispatch is not None and x.ndim == 2:
+            return self._dispatch(x, self.weight, False)
+        return F.linear(x.float(), self.weight)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -156,7 +178,7 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            all_reduce(y)
+            y = all_reduce(y)
         return y
 
 
@@ -291,7 +313,7 @@ class FP8RowParallelLinear(FP8LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.apply(x)
         if self.tp_size > 1:
-            all_reduce(y)
+            y = all_reduce(y)
         return y
 
 
@@ -343,7 +365,7 @@ class NVFP4RowParallelLinear(NVFP4LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.apply(x)
         if self.tp_size > 1 and self.reduce_results:
-            all_reduce(y)
+            y = all_reduce(y)
         return y
 
 
@@ -352,18 +374,12 @@ class NVFP4GroupedLinear(nn.Module):
     def __init__(self, num_experts: int, input_size: int, output_size: int):
         super().__init__()
         assert input_size % 16 == 0 and output_size % 128 == 0
-        scale_size = output_size // 128 * ((input_size // 16 + 3) // 4) * 512
-        self.weight = nn.Parameter(torch.empty(num_experts, input_size // 2, output_size,
+        # Canonical NVFP4 MoE layout shared with FlashInfer-CUTLASS:
+        # [experts, output, packed_input] and [experts, output, input/16]
+        # block scales, matching vLLM's NVFP4 expert parameters.
+        self.weight = nn.Parameter(torch.empty(num_experts, output_size, input_size // 2,
                                                dtype=torch.float4_e2m1fn_x2), requires_grad=False)
-        self.weight_scale_inv = nn.Parameter(torch.empty(num_experts, scale_size,
+        self.weight_scale_inv = nn.Parameter(torch.empty(num_experts, output_size, input_size // 16,
                                                          dtype=torch.float8_e4m3fn), requires_grad=False)
         self.weight_global_scale = nn.Parameter(torch.empty(num_experts, dtype=torch.float32), requires_grad=False)
         self.register_buffer("input_global_scale", torch.tensor(1.0 / 448.0, dtype=torch.float32), persistent=False)
-
-    def forward(self, x: torch.Tensor, expert_ids: torch.Tensor, group_sizes: torch.Tensor) -> torch.Tensor:
-        groups, tokens, hidden_size = x.shape
-        packed, scales, _ = quant_nvfp4_fixed(x.reshape(groups * tokens, hidden_size), self.input_global_scale)
-        return grouped_nvfp4_mm(
-            packed.reshape(groups, tokens, hidden_size // 2), self.weight, scales, self.weight_scale_inv,
-            self.input_global_scale, self.weight_global_scale, expert_ids, group_sizes,
-        )

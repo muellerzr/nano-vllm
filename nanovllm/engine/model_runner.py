@@ -10,7 +10,9 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.minimax_m2 import MiniMaxM2ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.layers.attention import make_flashinfer_decode_state, make_flashinfer_prefill_state
 from nanovllm.utils.loader import load_model, initialize_dummy_weights
+from nanovllm.utils.compile import maybe_compile
 
 
 class ModelRunner:
@@ -24,6 +26,13 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.shm_name = os.getenv("NANOVLLM_SHM_NAME", "nanovllm")
+        kv_dtype_name = os.getenv("NANOVLLM_KV_CACHE_DTYPE", "bf16").lower()
+        if kv_dtype_name in ("fp8", "fp8_e4m3", "fp8_e4m3fn"):
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        elif kv_dtype_name in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = hf_config.dtype
+        else:
+            raise ValueError(f"Unsupported NANOVLLM_KV_CACHE_DTYPE={kv_dtype_name!r}")
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -35,6 +44,7 @@ class ModelRunner:
             initialize_dummy_weights(self.model)
         else:
             load_model(self.model, config.model)
+        self.model = maybe_compile(self.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -114,10 +124,19 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch.tensor([], dtype=self.kv_cache_dtype).element_size()
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(
+            2,
+            hf_config.num_hidden_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=self.kv_cache_dtype,
+            device="cuda",
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -171,7 +190,31 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        hf_config = self.config.hf_config
+        flashinfer_prefill = make_flashinfer_prefill_state(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_tables,
+            num_heads=hf_config.num_attention_heads // self.world_size,
+            num_kv_heads=hf_config.num_key_value_heads // self.world_size,
+            head_dim=getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads),
+            page_size=self.block_size,
+            q_dtype=hf_config.dtype,
+            kv_dtype=self.kv_cache_dtype,
+            scale=getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads) ** -0.5,
+            backend=os.getenv("NANOVLLM_ATTENTION_BACKEND", "flashinfer"),
+        )
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            flashinfer_prefill=flashinfer_prefill,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -189,7 +232,27 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        hf_config = self.config.hf_config
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        flashinfer_decode = make_flashinfer_decode_state(
+            block_tables,
+            context_lens,
+            num_heads=hf_config.num_attention_heads // self.world_size,
+            num_kv_heads=hf_config.num_key_value_heads // self.world_size,
+            head_dim=head_dim,
+            page_size=self.block_size,
+            q_dtype=hf_config.dtype,
+            kv_dtype=self.kv_cache_dtype,
+            scale=head_dim ** -0.5,
+            backend=os.getenv("NANOVLLM_ATTENTION_BACKEND", "flashinfer"),
+        )
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            flashinfer_decode=flashinfer_decode,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

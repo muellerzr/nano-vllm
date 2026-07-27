@@ -1,6 +1,48 @@
 from functools import lru_cache
 import torch
 from torch import nn
+from nanovllm.utils.compile import compile_inner
+
+
+def _flashinfer_rope_op(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_dim: int,
+    cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    import flashinfer
+
+    flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(
+        positions, query, key, head_dim, cache, is_neox
+    )
+
+
+def _flashinfer_rope_fake(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_dim: int,
+    cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    del positions, query, key, head_dim, cache, is_neox
+
+
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="nanovllm_flashinfer_rope",
+        op_func=_flashinfer_rope_op,
+        mutates_args=["query", "key"],
+        fake_impl=_flashinfer_rope_fake,
+    )
+    _FLASHINFER_ROPE_OP = torch.ops.vllm.nanovllm_flashinfer_rope
+except (ImportError, AttributeError, RuntimeError):
+    _FLASHINFER_ROPE_OP = None
+from nanovllm.utils.compile import compile_inner
 
 
 def apply_rotary_emb(
@@ -35,7 +77,7 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    @compile_inner
     def forward(
         self,
         positions: torch.Tensor,

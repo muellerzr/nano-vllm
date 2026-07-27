@@ -18,12 +18,16 @@ import torch.distributed as dist
 from transformers import PretrainedConfig
 
 from nanovllm.layers.compressed_collective import all_reduce, reset_stats, stats
+from nanovllm.layers.attention import make_flashinfer_decode_state, make_flashinfer_prefill_state
 from nanovllm.models.minimax_m2 import MiniMaxM2ForCausalLM
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.context import reset_context, set_context
+from nanovllm.utils.compile import maybe_compile
 
 
 CASES = (("prefill", 32, 16), ("decode", 1, 16), ("prefill", 4, 512), ("decode", 1, 2048))
+PINNED_VLLM_IMAGE_DIGEST = "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d"
+PINNED_VLLM_COMMIT = "1240c74c0a47473449cf0c3a9c2d87a1e159f73b"
 
 
 def rank_max(value: float) -> float:
@@ -40,12 +44,39 @@ def source_revision() -> str:
         return "container-source"
 
 
+def runtime_metadata() -> dict:
+    try:
+        import vllm
+
+        vllm_version = getattr(vllm, "__version__", "unknown")
+    except ImportError:
+        vllm_version = "unavailable"
+    return {
+        "attention_backend": os.getenv("NANOVLLM_ATTENTION_BACKEND", "flashinfer"),
+        "qk_norm_backend": os.getenv("NANOVLLM_QK_NORM_BACKEND", "vllm"),
+        "all_reduce_backend": os.getenv("NANOVLLM_ALL_REDUCE_BACKEND", "vllm"),
+        "fp8_all_reduce": os.getenv("NANOVLLM_FP8_ALL_REDUCE", "0"),
+        "fp8_all_reduce_min_bytes": int(os.getenv("NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES", str(3 * 1024 * 1024))),
+        "kv_cache_dtype": os.getenv("NANOVLLM_KV_CACHE_DTYPE", "bf16"),
+        "image_digest": os.getenv("NANOVLLM_IMAGE_DIGEST", PINNED_VLLM_IMAGE_DIGEST),
+        "torch_compile": os.getenv("NANOVLLM_TORCH_COMPILE", "0"),
+        "torch_compile_mode": os.getenv("NANOVLLM_TORCH_COMPILE_MODE", "default"),
+        "vllm_version": vllm_version,
+        "vllm_source_commit": os.getenv("NANOVLLM_VLLM_COMMIT", PINNED_VLLM_COMMIT),
+    }
+
+
 def seed_weights(model: torch.nn.Module, seed: int) -> None:
     torch.manual_seed(seed)
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if name.endswith("weight_scale_inv"):
                 parameter.fill_(1)
+            elif getattr(torch, "float4_e2m1fn_x2", None) is not None and parameter.dtype == torch.float4_e2m1fn_x2:
+                # PyTorch's Float4 storage has no normal-kernel.  Zero is a
+                # deterministic representable synthetic expert weight and
+                # keeps this harness independent of real checkpoints.
+                parameter.view(torch.uint8).zero_()
             elif parameter.dtype == torch.float8_e4m3fn:
                 parameter.copy_(torch.randn(parameter.shape, device="cuda", dtype=torch.bfloat16).to(parameter.dtype))
             elif parameter.ndim == 1 and name.endswith(".weight"):
@@ -107,7 +138,18 @@ def case(model, config, phase: str, batch: int, context: int, args) -> dict:
         input_ids = torch.zeros(batch * context, dtype=torch.int64, device="cuda")
         positions = torch.arange(context, dtype=torch.int64, device="cuda").repeat(batch)
         cu = torch.arange(0, (batch + 1) * context, context, dtype=torch.int32, device="cuda")
-        set_context(True, cu, cu, context, context)
+        fi_prefill = make_flashinfer_prefill_state(
+            cu, cu, None,
+            num_heads=config.num_attention_heads // dist.get_world_size(),
+            num_kv_heads=config.num_key_value_heads // dist.get_world_size(),
+            head_dim=config.head_dim,
+            page_size=args.block_size,
+            q_dtype=config.dtype,
+            kv_dtype=config.dtype,
+            scale=config.head_dim ** -0.5,
+            backend="flashinfer",
+        )
+        set_context(True, cu, cu, context, context, flashinfer_prefill=fi_prefill)
         cleanup = None
         tokens = batch * context
     else:
@@ -115,12 +157,35 @@ def case(model, config, phase: str, batch: int, context: int, args) -> dict:
         input_ids = torch.zeros(batch, dtype=torch.int64, device="cuda")
         positions = torch.full((batch,), context - 1, dtype=torch.int64, device="cuda")
         lengths = torch.full((batch,), context, dtype=torch.int32, device="cuda")
-        set_context(False, slot_mapping=slots, context_lens=lengths, block_tables=tables)
+        fi_decode = make_flashinfer_decode_state(
+            tables, lengths,
+            num_heads=config.num_attention_heads // dist.get_world_size(),
+            num_kv_heads=config.num_key_value_heads // dist.get_world_size(),
+            head_dim=config.head_dim,
+            page_size=args.block_size,
+            q_dtype=config.dtype,
+            kv_dtype=config.dtype,
+            scale=config.head_dim ** -0.5,
+            backend="flashinfer",
+        )
+        set_context(False, slot_mapping=slots, context_lens=lengths, block_tables=tables,
+                    flashinfer_decode=fi_decode)
         cleanup = cache
         tokens = batch
 
     def run():
         return model.compute_logits(model(input_ids, positions))
+
+    if args.torch_profile and phase == "decode" and context == 2048:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False,
+        ) as profiler:
+            run()
+        if dist.get_rank() == 0:
+            print(profiler.key_averages().table(
+                sort_by="self_cuda_time_total", row_limit=40
+            ), flush=True)
 
     result = time_forward(run, tokens, args.warmup, args.iterations)
     reset_context()
@@ -160,12 +225,15 @@ def parse_args():
     parser.add_argument("--min-bytes", type=int, default=3 * 1024 * 1024)
     parser.add_argument("--world-size", type=int)
     parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument("--validation-only", action="store_true")
+    parser.add_argument("--torch-profile", action="store_true")
     parser.add_argument("--input-tokens", type=int, default=10000)
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--case", choices=("all", "prefill16", "decode16", "prefill512", "decode2048"), default="all")
     return parser.parse_args()
 
 
@@ -247,7 +315,7 @@ def run_long_context(args) -> None:
         result = measure_generation(llm, prompts, params, args.warmup, args.iterations, config["vocab_size"])
         result.update({"mode": mode, "source_revision": source_revision(), "seed": args.seed,
                        "world_size": args.world_size or 4, "warmup": args.warmup, "iterations": args.iterations,
-                       "config": str(args.config), "model": str(model_dir)})
+                       "config": str(args.config), "model": str(model_dir), **runtime_metadata()})
         print(json.dumps({"event": "long_context_result", **result}, sort_keys=True), flush=True)
         llm.exit()
         del llm
@@ -266,23 +334,35 @@ def run(args) -> None:
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     rank = dist.get_rank()
     config = PretrainedConfig.from_dict(json.loads(args.config.read_text()))
+    selected_cases = {
+        "all": CASES,
+        "prefill16": (CASES[0],),
+        "decode16": (CASES[1],),
+        "prefill512": (CASES[2],),
+        "decode2048": (CASES[3],),
+    }[args.case]
     torch.set_default_dtype(config.dtype)
     torch.set_default_device("cuda")
     model = MiniMaxM2ForCausalLM(config).eval()
     seed_weights(model, args.seed)
+    model = maybe_compile(model)
     torch.cuda.synchronize()
     dist.barrier()
     if rank == 0:
-        print(json.dumps({"event": "metadata", "source_revision": source_revision(), "host": socket.gethostname(), "platform": platform.platform(), "torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(), "capability": list(torch.cuda.get_device_capability()), "world_size": dist.get_world_size(), "seed": args.seed, "warmup": args.warmup, "iterations": args.iterations, "min_bytes": args.min_bytes, "cases": CASES}, sort_keys=True), flush=True)
+        print(json.dumps({"event": "metadata", "source_revision": source_revision(), "host": socket.gethostname(), "platform": platform.platform(), "torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(), "capability": list(torch.cuda.get_device_capability()), "world_size": dist.get_world_size(), "seed": args.seed, "warmup": args.warmup, "iterations": args.iterations, "min_bytes": args.min_bytes, "cases": selected_cases, **runtime_metadata()}, sort_keys=True), flush=True)
     if not args.skip_validation:
         validation = validate_collective(args)
         if rank == 0:
             print(json.dumps({"event": "collective_validation", **validation}, sort_keys=True), flush=True)
+        if args.validation_only:
+            dist.barrier()
+            dist.destroy_process_group()
+            return
     modes = ("baseline", "compressed") if args.mode == "both" else (args.mode,)
     with torch.inference_mode():
         for mode in modes:
             os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1" if mode == "compressed" else "0"
-            for phase, batch, context in CASES:
+            for phase, batch, context in selected_cases:
                 result = case(model, config, phase, batch, context, args)
                 if rank == 0:
                     print(json.dumps({"event": "result", "mode": mode, **result}, sort_keys=True), flush=True)

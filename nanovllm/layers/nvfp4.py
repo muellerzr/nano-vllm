@@ -93,7 +93,11 @@ def grouped_nvfp4_mm_kernel(x, weight, x_scales, weight_scales, x_global_scales,
         offsets_k = block * (block_k // 2) + tl.arange(0, block_k // 2)
         x_values = tl.load(x + group * m * (k // 2) + offsets_m[:, None] * (k // 2) + offsets_k[None, :],
                            mask=(offsets_m[:, None] < group_size) & (offsets_k[None, :] < k // 2), other=0)
-        weight_values = tl.load(weight + expert * (k // 2) * n + offsets_k[:, None] * n + offsets_n[None, :],
+        # FlashInfer-CUTLASS and the canonical modelopt layout store expert
+        # weights as [experts, output, packed_input].  Keep the custom kernel
+        # on that same layout so the fast backend can consume the parameters
+        # without a per-forward transpose.
+        weight_values = tl.load(weight + expert * (k // 2) * n + offsets_n[None, :] * (k // 2) + offsets_k[:, None],
                                 mask=offsets_k[:, None] < k // 2, other=0)
         scale_k = block * (block_k // 16) + tl.arange(0, block_k // 16)
         x_scale_offsets = (512 * ((offsets_m[:, None] // 128) * scale_columns + scale_k[None, :] // 4)
@@ -116,7 +120,7 @@ def grouped_nvfp4_mm_kernel(x, weight, x_scales, weight_scales, x_global_scales,
 def grouped_nvfp4_mm(x, weight, x_scales, weight_scales, x_global_scales,
                      weight_global_scales, expert_ids, group_sizes):
     groups, m, packed_k = x.shape
-    k, n = packed_k * 2, weight.shape[-1]
+    k, n = packed_k * 2, weight.shape[-2]
     block_m = block_n = 128
     block_k = 256
     scale_columns = triton.cdiv(k // 16, 4)
