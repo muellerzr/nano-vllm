@@ -147,12 +147,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--min-bytes", type=int, default=3 * 1024 * 1024)
+    parser.add_argument("--world-size", type=int)
     parser.add_argument("--skip-validation", action="store_true")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run(args) -> None:
     os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
     os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
     dist.init_process_group("nccl")
@@ -181,6 +181,28 @@ def main() -> None:
                     print(json.dumps({"event": "result", "mode": mode, **result}, sort_keys=True), flush=True)
     dist.barrier()
     dist.destroy_process_group()
+
+
+def _spawn_rank(rank: int, world_size: int, args) -> None:
+    os.environ.update(
+        MASTER_ADDR=os.getenv("MASTER_ADDR", "127.0.0.1"),
+        MASTER_PORT=os.getenv("MASTER_PORT", "29501"),
+        RANK=str(rank),
+        LOCAL_RANK=str(rank),
+        WORLD_SIZE=str(world_size),
+    )
+    run(args)
+
+
+def main() -> None:
+    args = parse_args()
+    if "RANK" not in os.environ:
+        world_size = args.world_size or torch.cuda.device_count()
+        if world_size < 2:
+            raise RuntimeError("TP reproduction requires at least two CUDA devices")
+        torch.multiprocessing.spawn(_spawn_rank, args=(world_size, args), nprocs=world_size)
+    else:
+        run(args)
 
 
 if __name__ == "__main__":
