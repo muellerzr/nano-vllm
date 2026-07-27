@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 
 @dataclass(slots=True)
@@ -23,5 +23,15 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.load_format in ["auto", "dummy"]
-        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        try:
+            self.hf_config = AutoConfig.from_pretrained(
+                self.model,
+                trust_remote_code=True,
+            )
+        except OSError:
+            if self.load_format != "dummy":
+                raise
+            # Synthetic benchmark directories intentionally contain only a
+            # plain config.json, not a model-specific remote-code module.
+            self.hf_config = PretrainedConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

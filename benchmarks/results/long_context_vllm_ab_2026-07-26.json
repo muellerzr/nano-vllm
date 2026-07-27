@@ -1,0 +1,134 @@
+{
+  "environment": {
+    "base_image": "vllm/vllm-openai:nightly-x86_64",
+    "base_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "deployment_image": "every-us-matters-vllm:wheel-ar-tested",
+    "source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": [12, 0],
+    "tensor_parallel_size": 4,
+    "attention_backend": "FLASHINFER",
+    "moe_backend": "FLASHINFER_CUTLASS",
+    "collective_backend": "PYNCCL"
+  },
+  "protocol": {
+    "dummy_seed": 1234,
+    "warmup": 1,
+    "iterations": 1,
+    "input_tokens": [10000, 20000],
+    "output_tokens": 512,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 2048,
+    "timing": "CUDA events around model forward plus logits; rank-max across TP4; wall time around end-to-end generate",
+    "compile_mode": 3,
+    "cudagraph_mode": "NONE",
+    "qk_norm_rope_fusion": true,
+    "kv_cache_dtype": "fp8_e4m3",
+    "prefix_caching": false,
+    "prompt_salts": "unique deterministic token IDs per warmup/measurement to prevent prefix-cache reuse"
+  },
+  "runs": {
+    "stock_vllm": {
+      "flags": {
+        "VLLM_FP8_ALL_REDUCE": "0",
+        "VLLM_SHARDED_DOWNSTREAM": "0",
+        "native_overlap": "off"
+      },
+      "compilation_config": {
+        "mode": 3,
+        "cudagraph_mode": "NONE",
+        "pass_config": {"enable_qk_norm_rope_fusion": true}
+      },
+      "memory_bytes_per_rank": 71725642752,
+      "results": {
+        "10000": {
+          "prefill_ms_model": 2077.7566157877445,
+          "prefill_tokens_per_second": 4812.883243405618,
+          "decode_ms_model": 23179.745022267103,
+          "decode_tokens_per_second": 22.088249871090415,
+          "wall_ms": 25757.720845984295,
+          "end_to_end_generated_tokens_per_second": 19.877535091767342,
+          "end_to_end_all_tokens_per_second": 408.11064235284823
+        },
+        "20000": {
+          "prefill_ms_model": 4390.34846881032,
+          "prefill_tokens_per_second": 4555.44705439282,
+          "decode_ms_model": 23282.173239588737,
+          "decode_tokens_per_second": 21.991074232254277,
+          "wall_ms": 28183.838967001066,
+          "end_to_end_generated_tokens_per_second": 18.166439305854436,
+          "end_to_end_all_tokens_per_second": 727.7929746907932
+        }
+      }
+    },
+    "vllm_with_adjustments": {
+      "flags": {
+        "VLLM_FP8_ALL_REDUCE": "1",
+        "VLLM_FP8_ALL_REDUCE_MIN_BYTES": 3145728,
+        "VLLM_SHARDED_DOWNSTREAM": "1",
+        "native_overlap": "off; long-context repeated SP requests retain stock path because prior SM120 PCIe repeats hung"
+      },
+      "compilation_config": {
+        "mode": 3,
+        "cudagraph_mode": "NONE",
+        "pass_config": {
+          "enable_qk_norm_rope_fusion": true,
+          "fuse_allreduce_rms": true
+        }
+      },
+      "memory_bytes_per_rank": 71725642752,
+      "results": {
+        "10000": {
+          "prefill_ms_model": 1361.775347262621,
+          "prefill_tokens_per_second": 7343.355143050245,
+          "decode_ms_model": 24786.31846496463,
+          "decode_tokens_per_second": 20.656556992266122,
+          "wall_ms": 26656.239792937413,
+          "end_to_end_generated_tokens_per_second": 19.207510285665073,
+          "end_to_end_all_tokens_per_second": 394.35419555256107,
+          "compressed_all_reduce_per_rank": {
+            "compressed_calls": 625,
+            "considered_calls": 64500,
+            "fallback_calls": 63875,
+            "input_bytes": 7680000000,
+            "payload_bytes": 3960000000
+          }
+        },
+        "20000": {
+          "prefill_ms_model": 2957.6211208105087,
+          "prefill_tokens_per_second": 6762.191363618334,
+          "decode_ms_model": 25050.19551989436,
+          "decode_tokens_per_second": 20.43896222659739,
+          "wall_ms": 28529.453172930516,
+          "end_to_end_generated_tokens_per_second": 17.94636570482181,
+          "end_to_end_all_tokens_per_second": 718.9762760494237,
+          "compressed_all_reduce_per_rank": {
+            "compressed_calls": 1250,
+            "considered_calls": 65125,
+            "fallback_calls": 63875,
+            "input_bytes": 15360000000,
+            "payload_bytes": 7920000000
+          }
+        }
+      }
+    }
+  },
+  "delta_tuned_vs_stock_percent": {
+    "10000": {
+      "prefill_tokens_per_second": 52.57704730551607,
+      "decode_tokens_per_second": -6.481694508074742,
+      "wall_ms": 3.4883480270856415,
+      "end_to_end_generated_tokens_per_second": -3.3707640459896493
+    },
+    "20000": {
+      "prefill_tokens_per_second": 48.44188249532062,
+      "decode_tokens_per_second": -7.057918086513515,
+      "wall_ms": 1.2262850576676643,
+      "end_to_end_generated_tokens_per_second": -1.2114294789827174
+    }
+  },
+  "correctness": "Mechanism correctness was validated in the isolated four-shape A/B artifact; native fuse_allreduce_rms matched the stock 256-logit sample exactly, and FP8 collective model-sample max absolute error was 1.01327896e-06."
+}

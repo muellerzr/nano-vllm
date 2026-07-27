@@ -1,0 +1,26 @@
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index a9175cf..0f44ccc 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -126,6 +126,21 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+     group = _groups[group_name]()
+     if group is None:
+         raise ValueError(f"Group {group_name} is destroyed.")
++    from vllm.distributed.compressed_all_reduce import (
++        FP8_ALL_REDUCE_ENABLED,
++        FP8_ALL_REDUCE_MIN_BYTES,
++        maybe_compressed_all_reduce,
++    )
++
++    if (
++        FP8_ALL_REDUCE_ENABLED
++        and tensor.numel() * tensor.element_size() < FP8_ALL_REDUCE_MIN_BYTES
++    ):
++        return group._all_reduce_out_place(tensor)
++
++    compressed = maybe_compressed_all_reduce(tensor, group)
++    if compressed is not None:
++        return compressed
+     return group._all_reduce_out_place(tensor)
+ 
+ 

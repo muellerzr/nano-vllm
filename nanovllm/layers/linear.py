@@ -2,7 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8, w8a8_triton_block_scaled_mm
+
+from nanovllm.layers.fp8 import all_reduce, block_scaled_mm, quant_fp8
+from nanovllm.layers.nvfp4 import grouped_nvfp4_mm, nvfp4_mm, quant_nvfp4_fixed
 
 
 def divide(numerator, denominator):
@@ -180,14 +182,12 @@ class FP8LinearBase(nn.Module):
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, shape[-1])
-        x, x_scale = per_token_group_quant_fp8(x, 128)
-        y = w8a8_triton_block_scaled_mm(
+        x, x_scale = quant_fp8(x)
+        y = block_scaled_mm(
             x,
             self.weight,
             x_scale,
             self.weight_scale_inv,
-            [128, 128],
-            output_dtype=torch.bfloat16,
         )
         return y.reshape(*shape[:-1], -1)
 
@@ -274,9 +274,11 @@ class FP8RowParallelLinear(FP8LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        reduce_results: bool = True,
     ):
         tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        self.reduce_results = reduce_results
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         loaded_weight = loaded_weight.squeeze()
@@ -287,6 +289,184 @@ class FP8RowParallelLinear(FP8LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.apply(x)
-        if self.tp_size > 1:
-            dist.all_reduce(y)
+        if self.tp_size > 1 and self.reduce_results:
+            y = all_reduce(y)
         return y
+
+
+class NVFP4LinearBase(nn.Module):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        tp_dim: int | None = None,
+    ):
+        super().__init__()
+        assert not bias
+        assert input_size % 16 == 0 and output_size % 128 == 0
+        self.tp_dim = tp_dim
+        self.tp_rank = dist.get_rank()
+        self.tp_size = dist.get_world_size()
+        scale_size = output_size // 128 * ((input_size // 16 + 3) // 4) * 512
+        self.weight = nn.Parameter(
+            torch.empty(output_size, input_size // 2, dtype=torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty(scale_size, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        self.weight_global_scale = nn.Parameter(
+            torch.empty(1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.register_buffer(
+            "input_global_scale",
+            torch.tensor(1.0 / 448.0, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def apply(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        x, x_scale, x_global_scale = quant_nvfp4_fixed(
+            x,
+            self.input_global_scale,
+        )
+        y = nvfp4_mm(
+            x,
+            self.weight,
+            x_scale,
+            self.weight_scale_inv,
+            x_global_scale,
+            self.weight_global_scale,
+        )
+        return y.reshape(*shape[:-1], -1)
+
+
+class NVFP4ColumnParallelLinear(NVFP4LinearBase):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+    ):
+        tp_size = dist.get_world_size()
+        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.apply(x)
+
+
+class NVFP4MergedColumnParallelLinear(NVFP4ColumnParallelLinear):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(input_size, sum(output_sizes), bias)
+
+
+class NVFP4QKVParallelLinear(NVFP4ColumnParallelLinear):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        bias: bool = False,
+    ):
+        tp_size = dist.get_world_size()
+        self.head_size = head_size
+        self.num_heads = divide(total_num_heads, tp_size)
+        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+        output_size = (total_num_heads + 2 * total_num_kv_heads) * head_size
+        super().__init__(hidden_size, output_size, bias)
+
+
+class NVFP4RowParallelLinear(NVFP4LinearBase):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = False,
+        reduce_results: bool = True,
+    ):
+        tp_size = dist.get_world_size()
+        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        self.reduce_results = reduce_results
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.apply(x)
+        if self.tp_size > 1 and self.reduce_results:
+            y = all_reduce(y)
+        return y
+
+
+class NVFP4GroupedLinear(nn.Module):
+
+    def __init__(
+        self,
+        num_experts: int,
+        input_size: int,
+        output_size: int,
+    ):
+        super().__init__()
+        assert input_size % 16 == 0 and output_size % 128 == 0
+        scale_size = output_size // 128 * ((input_size // 16 + 3) // 4) * 512
+        self.weight = nn.Parameter(
+            torch.empty(
+                num_experts,
+                input_size // 2,
+                output_size,
+                dtype=torch.float4_e2m1fn_x2,
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.empty(
+                num_experts,
+                scale_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        self.weight_global_scale = nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.register_buffer(
+            "input_global_scale",
+            torch.tensor(1.0 / 448.0, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        group_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        groups, tokens, hidden_size = x.shape
+        x, x_scales, _ = quant_nvfp4_fixed(
+            x.reshape(groups * tokens, hidden_size),
+            self.input_global_scale,
+        )
+        return grouped_nvfp4_mm(
+            x.reshape(groups, tokens, hidden_size // 2),
+            self.weight,
+            x_scales,
+            self.weight_scale_inv,
+            self.input_global_scale,
+            self.weight_global_scale,
+            expert_ids,
+            group_sizes,
+        )

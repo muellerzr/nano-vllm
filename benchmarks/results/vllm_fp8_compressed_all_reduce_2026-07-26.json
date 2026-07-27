@@ -1,0 +1,121 @@
+{
+  "status": "validated_feature_on_ab_with_scheduler_adaptation",
+  "environment": {
+    "base_image": "vllm/vllm-openai:nightly-x86_64",
+    "base_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "deployment_image": "every-us-matters-vllm:wheel-ar-tested",
+    "deployment_image_id": "sha256:cadbe8def690e0ebdbfdd04be86b2ba63b8d41ddfb0eb4b58c0e54271745cf95",
+    "source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": [12, 0],
+    "tensor_parallel_size": 4,
+    "topology": "four PCIe GPUs",
+    "stock_all_reduce_backend": "PYNCCL",
+    "protected_container_check": "glm-ray-worker remained stopped and untouched"
+  },
+  "protocol": {
+    "dummy_weight_seed": 1234,
+    "scheduler_seed": 0,
+    "warmup": 5,
+    "iterations": 100,
+    "timing": "CUDA events around model forward plus logits, maximum mean rank latency",
+    "compilation_mode": 3,
+    "cudagraph_mode": "NONE",
+    "enable_qk_norm_rope_fusion": true,
+    "kv_cache_dtype": "fp8_e4m3",
+    "shapes": [
+      {"phase": "prefill", "batch": 32, "context": 16},
+      {"phase": "decode", "batch": 1, "context": 16},
+      {"phase": "prefill", "batch": 4, "context": 512},
+      {"phase": "decode", "batch": 1, "context": 2048}
+    ]
+  },
+  "baseline_reproduction": {
+    "old_published_reference_ms": {
+      "prefill_b32_c16": 109.365314,
+      "decode_b1_c16": 45.287964,
+      "prefill_b4_c512": 406.428414,
+      "decode_b1_c2048": 45.814919
+    },
+    "current_scheduler_adapted_control_ms": {
+      "prefill_b32_c16": 153.234840,
+      "decode_b1_c16": 45.310126,
+      "prefill_b4_c512": 418.156781,
+      "decode_b1_c2048": 45.768664
+    },
+    "adaptation": "Current pinned nightly emits chunked prefill forward events (for example 16 + 496 tokens). The harness now groups all chunks belonging to one logical request and sums their forward-plus-logits event time. This preserves the requested logical shapes while measuring the scheduler that actually ran."
+  },
+  "native_feature_audit": {
+    "fuse_gemm_comms_present": true,
+    "sequence_parallel_moe_present": true,
+    "minimax_m2_uses_sequence_parallel_moe": false,
+    "sequence_parallel_moe_requirement": "expert parallel plus data parallel greater than one",
+    "stock_sm120_pcie_backends": {
+      "PYNCCL": "selected",
+      "NCCL_SYMM_MEM": "unsupported on compute capability 12.0",
+      "custom_all_reduce": "unsupported on more than two PCIe-only GPUs"
+    }
+  },
+  "compressed_collective": {
+    "feature_flag": "VLLM_FP8_ALL_REDUCE",
+    "threshold_flag": "VLLM_FP8_ALL_REDUCE_MIN_BYTES",
+    "threshold_bytes": 3145728,
+    "format": "float8_e4m3fn",
+    "block_size": 128,
+    "eligible_input": "contiguous CUDA BF16 sum reduction, size at least threshold, numel divisible by 128, compute capability at least 9, PyNCCL available",
+    "payload": "one FP8 byte plus one FP32 scale per 128 BF16 elements",
+    "fallbacks": ["disabled", "dtype", "device", "threshold", "layout", "capability", "backend"],
+    "off_path": "returns to stock vLLM group._all_reduce_out_place without touching the communicator"
+  },
+  "local_tests": {
+    "command": "PYTHONPYCACHEPREFIX=/tmp/every-us-matters-pycache python3 -m unittest discover -s tests -v",
+    "passed": 19,
+    "checks": [
+      "policy disabled/threshold/dtype/device/layout/capability/backend fallbacks",
+      "inclusive 3 MiB threshold and payload accounting",
+      "single-forward and chunked-prefill event grouping",
+      "decode prompt-plus-token grouping",
+      "incomplete logical request rejection"
+    ],
+    "static_checks": ["git diff --check", "py_compile"]
+  },
+  "collective_microbenchmark": [
+    {"tokens": 1, "input_bytes": 6144, "selected": false, "baseline_ms": 0.0264045, "candidate_ms": 0.0324384, "speedup": 0.8140, "mean_relative_error": 0.0, "max_relative_error": 0.0},
+    {"tokens": 16, "input_bytes": 98304, "selected": false, "baseline_ms": 0.0389062, "candidate_ms": 0.0388730, "speedup": 1.00086, "mean_relative_error": 0.0, "max_relative_error": 0.0},
+    {"tokens": 128, "input_bytes": 786432, "selected": false, "baseline_ms": 0.1864166, "candidate_ms": 0.1858422, "speedup": 1.00309, "mean_relative_error": 0.0, "max_relative_error": 0.0},
+    {"tokens": 512, "input_bytes": 3145728, "selected": true, "baseline_ms": 0.7439859, "candidate_ms": 0.4596310, "speedup": 1.61866, "mean_relative_error": 0.0457384, "max_relative_error": 0.0945122},
+    {"tokens": 2048, "input_bytes": 12582912, "selected": true, "baseline_ms": 2.8901822, "candidate_ms": 1.6326825, "speedup": 1.77020, "mean_relative_error": 0.0456747, "max_relative_error": 0.1039326}
+  ],
+  "model_correctness_smoke": {
+    "comparison": "feature-off versus feature-on, warmup 0, iterations 1, same synthetic model and scheduler seeds",
+    "sample": "first 256 flattened logits from rank 0; timing excludes CPU copy",
+    "results": [
+      {"phase": "prefill", "batch": 32, "context": 16, "max_abs_error": 7.45e-09, "mean_abs_error": 2.91e-11, "exact_values": 255, "sample_values": 256, "compressed_calls": 0, "fallback_calls": 250},
+      {"phase": "decode", "batch": 1, "context": 16, "max_abs_error": 0.0, "mean_abs_error": 0.0, "exact_values": 256, "sample_values": 256, "compressed_calls": 0, "fallback_calls": 250},
+      {"phase": "prefill", "batch": 4, "context": 512, "max_abs_error": 1.01327896e-06, "mean_abs_error": 2.3643588e-07, "compressed_calls": 250, "fallback_calls": 0},
+      {"phase": "decode", "batch": 1, "context": 2048, "max_abs_error": 1.01327896e-06, "mean_abs_error": 2.3642860e-07, "compressed_calls": 125, "fallback_calls": 125}
+    ]
+  },
+  "model_ab_scheduler_adapted": [
+    {"phase": "prefill", "batch": 32, "context": 16, "feature_off_ms": 153.234840, "feature_on_ms": 154.817143, "speedup": 0.989780, "delta_percent": 1.0326, "selected": false, "fallback": "threshold"},
+    {"phase": "decode", "batch": 1, "context": 16, "feature_off_ms": 45.310126, "feature_on_ms": 45.807804, "speedup": 0.989136, "delta_percent": 1.0984, "selected": false, "fallback": "threshold"},
+    {"phase": "prefill", "batch": 4, "context": 512, "feature_off_ms": 418.156781, "feature_on_ms": 275.712669, "speedup": 1.516640, "delta_percent": -34.0648, "selected": true, "compressed_calls_per_rank": 25000, "input_bytes_per_rank": 157286400000, "payload_bytes_per_rank": 81100800000},
+    {"phase": "decode", "batch": 1, "context": 2048, "feature_off_ms": 45.768664, "feature_on_ms": 46.287477, "speedup": 0.988791, "delta_percent": 1.1336, "selected": "mixed", "compressed_calls_per_rank": 12500, "fallback_calls_per_rank": 12500, "input_bytes_per_rank": 157286400000, "payload_bytes_per_rank": 81100800000}
+  ],
+  "memory": {
+    "feature_off_allocated_bytes_per_rank": 35898358784,
+    "feature_on_allocated_bytes_per_rank": 35899374592,
+    "compute_capabilities": [[12, 0], [12, 0], [12, 0], [12, 0]]
+  },
+  "artifacts": {
+    "feature_off_log": "/home/zach/every-us-matters/results/wheel_ar_off.log",
+    "feature_on_log": "/home/zach/every-us-matters/results/wheel_ar_on.log",
+    "correctness_off_log": "/home/zach/every-us-matters/results/wheel_ar_correct_off4.log",
+    "correctness_on_log": "/home/zach/every-us-matters/results/wheel_ar_correct_on.log",
+    "collective_log": "/home/zach/every-us-matters/results/collective_test_revised.log"
+  },
+  "next_mechanism": "The compressed collective remains isolated. Native overlap and sharded downstream are separately policy-gated, with native allreduce+RMSNorm selected and native SP selected only for stable isolated cases; see experimental_mechanisms_2026-07-26.json for the full matrix."
+}

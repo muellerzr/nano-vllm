@@ -1,0 +1,52 @@
+{
+  "protocol": {
+    "input_tokens_per_request": 10000,
+    "output_tokens_per_request": 512,
+    "concurrency": [4, 8, 16, 32],
+    "warmup": 1,
+    "iterations": 1,
+    "tensor_parallel_size": 4,
+    "dummy_seed": 1234,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 2048,
+    "cudagraph_mode": "NONE",
+    "prefix_caching": false,
+    "unique_prompt_salts": true
+  },
+  "environment": {
+    "base_image": "vllm/vllm-openai:nightly-x86_64",
+    "base_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": [12, 0],
+    "collective_backend": "PYNCCL",
+    "attention_backend": "FLASHINFER",
+    "moe_backend": "FLASHINFER_CUTLASS"
+  },
+  "stock": {
+    "flags": {"VLLM_FP8_ALL_REDUCE": "0", "VLLM_SHARDED_DOWNSTREAM": "0"},
+    "results": {
+      "4": {"prefill_ms": 9091.773748666048, "prefill_tokens_per_second": 4399.58154544583, "decode_ms": 22908.2231477499, "decode_tokens_per_second": 89.40021174017416, "wall_ms": 32565.0570159778, "end_to_end_generated_tokens_per_second": 62.8894952953764, "allocated_bytes_per_rank": 71725691904},
+      "8": {"prefill_ms": 18509.904625803232, "prefill_tokens_per_second": 4322.010384023166, "decode_ms": 21988.53027486801, "decode_tokens_per_second": 186.2789349173355, "wall_ms": 41105.57442693971, "end_to_end_generated_tokens_per_second": 99.64585234735388, "allocated_bytes_per_rank": 71732161536},
+      "16": {"prefill_ms": 37404.485982865095, "prefill_tokens_per_second": 4277.561789601804, "decode_ms": 20878.78724783659, "decode_tokens_per_second": 392.35995380185864, "wall_ms": 59030.947488034144, "end_to_end_generated_tokens_per_second": 138.77466563891014, "allocated_bytes_per_rank": 71738694656},
+      "32": {"prefill_ms": 75724.26079106331, "prefill_tokens_per_second": 4225.858353149684, "decode_ms": 17275.91579556465, "decode_tokens_per_second": 948.3723001362603, "wall_ms": 93986.22467496898, "end_to_end_generated_tokens_per_second": 174.32341874206054, "allocated_bytes_per_rank": 71526759424}
+    }
+  },
+  "optimized": {
+    "flags": {"VLLM_FP8_ALL_REDUCE": "1", "VLLM_FP8_ALL_REDUCE_MIN_BYTES": 3145728, "VLLM_FP8_ALL_REDUCE_STATS": "0", "VLLM_SHARDED_DOWNSTREAM": "0"},
+    "results": {
+      "4": {"prefill_ms": 6218.344312489033, "prefill_tokens_per_second": 6432.580441012778, "decode_ms": 23047.234786719084, "decode_tokens_per_second": 88.86098566497684, "wall_ms": 29823.988578049466, "end_to_end_generated_tokens_per_second": 68.669554195958, "allocated_bytes_per_rank": 71725691904},
+      "8": {"prefill_ms": 12744.976990789175, "prefill_tokens_per_second": 6276.982693481219, "decode_ms": 22026.768265008926, "decode_tokens_per_second": 185.9555587419869, "wall_ms": 35376.05778500438, "end_to_end_generated_tokens_per_second": 115.78452367115538, "allocated_bytes_per_rank": 71732161536},
+      "16": {"prefill_ms": 25821.177243709564, "prefill_tokens_per_second": 6196.464184799261, "decode_ms": 20583.518534600735, "decode_tokens_per_second": 397.9883218813786, "wall_ms": 47117.5254980335, "end_to_end_generated_tokens_per_second": 173.86312021716637, "allocated_bytes_per_rank": 71738694656},
+      "32": {"prefill_ms": 52429.017562270164, "prefill_tokens_per_second": 6103.490297523402, "decode_ms": 17367.43431842327, "decode_tokens_per_second": 943.3748071020456, "wall_ms": 70805.97579595633, "end_to_end_generated_tokens_per_second": 231.3928989159652, "allocated_bytes_per_rank": 71524727808}
+    }
+  },
+  "optimized_vs_stock_percent": {
+    "4": {"prefill_tokens_per_second": 46.208915, "decode_tokens_per_second": -0.603160, "wall_ms": -8.417208, "end_to_end_generated_tokens_per_second": 9.190818},
+    "8": {"prefill_tokens_per_second": 45.232939, "decode_tokens_per_second": -0.173598, "wall_ms": -13.938539, "end_to_end_generated_tokens_per_second": 16.196029},
+    "16": {"prefill_tokens_per_second": 44.859724, "decode_tokens_per_second": 1.434491, "wall_ms": -20.181655, "end_to_end_generated_tokens_per_second": 25.284481},
+    "32": {"prefill_tokens_per_second": 44.431965, "decode_tokens_per_second": -0.526955, "wall_ms": -24.663454, "end_to_end_generated_tokens_per_second": 32.737701}
+  },
+  "capacity": "All requested concurrency levels completed without OOM or scheduler failure."
+}

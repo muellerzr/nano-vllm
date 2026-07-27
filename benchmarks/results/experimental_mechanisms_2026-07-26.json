@@ -1,0 +1,107 @@
+{
+  "environment": {
+    "base_image": "vllm/vllm-openai:nightly-x86_64",
+    "base_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "deployment_image": "every-us-matters-vllm:wheel-ar-tested",
+    "source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": [12, 0],
+    "tensor_parallel_size": 4,
+    "attention_backend": "FLASHINFER",
+    "moe_backend": "FLASHINFER_CUTLASS",
+    "collective_backend": "PYNCCL"
+  },
+  "protocol": {
+    "dummy_seed": 1234,
+    "scheduler_seed": 0,
+    "warmup": 5,
+    "iterations": 100,
+    "timing": "CUDA events around model forward plus logits; rank-max mean",
+    "compile_mode": 3,
+    "cudagraph_mode": "NONE",
+    "qk_norm_rope_fusion": true,
+    "kv_cache_dtype": "fp8_e4m3",
+    "shapes": ["prefill B32/C16", "decode B1/C16", "prefill B4/C512", "decode B1/C2048"]
+  },
+  "control_ms": {
+    "prefill_b32_c16": 153.234840,
+    "decode_b1_c16": 45.310126,
+    "prefill_b4_c512": 418.156781,
+    "decode_b1_c2048": 45.768664
+  },
+  "mechanisms": {
+    "fp8_compressed_collective": {
+      "flag": "VLLM_FP8_ALL_REDUCE=1",
+      "status": "selected_for_large_payloads",
+      "threshold_bytes": 3145728,
+      "isolated_mean_relative_error": 0.0457,
+      "isolated_max_relative_error_range": [0.0945, 0.1039],
+      "model_sample_max_abs_error": 1.01327896e-06,
+      "ab_ms": {
+        "prefill_b32_c16": 154.817143,
+        "decode_b1_c16": 45.807804,
+        "prefill_b4_c512": 275.712669,
+        "decode_b1_c2048": 46.287477
+      },
+      "selection": ["threshold fallback", "threshold fallback", "compressed", "mixed compressed/fallback"],
+      "speedups_vs_control": [0.989780, 0.989136, 1.516640, 0.988791]
+    },
+    "native_chunked_overlap": {
+      "flag": "VLLM_NATIVE_OVERLAP=1 VLLM_NATIVE_OVERLAP_FORCE=1",
+      "implementation": "vLLM native enable_sp + fuse_gemm_comms with sp_min_token_num=1; no competing stream implementation",
+      "policy": "isolated case runner; stable repeated cases are B32/C16 prefill and B1/C16 decode",
+      "status": "selected_for_stable_isolated_shapes",
+      "fallback_reason": "vLLM native SP retains scheduler state and hangs on repeated B4/C512 prefill and B1/C2048 decode on this SM120 PCIe topology",
+      "ab_ms": {
+        "prefill_b32_c16": 380.385904,
+        "decode_b1_c16": 87.244006,
+        "prefill_b4_c512": 418.156781,
+        "decode_b1_c2048": 45.768664
+      },
+      "speedups_vs_control": [0.402840, 0.519349, 1.0, 1.0],
+      "selected": [true, true, false, false],
+      "selection_reasons": ["isolated_shape", "isolated_shape", "shape_repeat_unsupported", "shape_repeat_unsupported"],
+      "memory_bytes_per_rank": 35931915264,
+      "correctness": "captured 256-logit samples max abs error 0.0 for both selected full A/B cases; one-iteration smoke completed all four shapes",
+      "scheduler_adaptation": "native-SP decode events are grouped with local token count batch*4; disabling chunked prefill also required max_num_batched_tokens=4096 but did not remove the large-shape repeat hang"
+    },
+    "sharded_downstream": {
+      "flag": "VLLM_SHARDED_DOWNSTREAM=1",
+      "implementation": "vLLM native fuse_allreduce_rms boundary; fused FlashInfer-CUTLASS MoE path remains untouched",
+      "status": "selected_native_allreduce_rms",
+      "fallback_reason": null,
+      "ab_ms": {
+        "prefill_b32_c16": 151.424968,
+        "decode_b1_c16": 44.729341,
+        "prefill_b4_c512": 418.509957,
+        "decode_b1_c2048": 45.460697
+      },
+      "speedups_vs_control": [1.011952, 1.012984, 0.999156, 1.006774],
+      "selected": true,
+      "memory_bytes_per_rank": 35898358784,
+      "correctness": "captured 256-logit samples max abs error 0.0 for all four full A/B cases"
+    },
+    "capability_size_backend_policy": {
+      "status": "active",
+      "checks": ["dtype", "CUDA device", "contiguous layout", "payload threshold", "SM capability", "PyNCCL availability", "MiniMax native-SP hidden/token thresholds", "native-SP isolated stable-shape policy", "fused-MoE full-hidden requirement"],
+      "fallback_behavior": "unsupported inputs retain stock vLLM behavior",
+      "test_count": 19
+    }
+  },
+  "memory_bytes_per_rank": {
+    "control": 35898358784,
+    "fp8_collective": 35899374592,
+    "native_overlap_smoke_selected": 35931915264,
+    "sharded_downstream": 35898358784
+  },
+  "artifacts": {
+    "compressed": "benchmarks/results/vllm_fp8_compressed_all_reduce_2026-07-26.json",
+    "native_overlap_log": "/home/zach/every-us-matters/results/native_overlap_forced_ab.log",
+    "native_overlap_stalled_shape_log": "/home/zach/every-us-matters/results/native_overlap_forced_nochunk_ab.log",
+    "sharded_downstream_log": "/home/zach/every-us-matters/results/sharded_native_rms_ab.log",
+    "forced_overlap_correctness_log": "/home/zach/every-us-matters/results/native_overlap_forced_correctness2.log"
+  }
+}

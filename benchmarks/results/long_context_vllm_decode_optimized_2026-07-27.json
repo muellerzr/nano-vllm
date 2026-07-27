@@ -1,0 +1,118 @@
+{
+  "paper": {
+    "title": "Every Microsecond Matters: Achieving Near Speed-of-Light Latency in GPU Collectives",
+    "arxiv": "2607.16100",
+    "adapted_lessons": [
+      "Keep small decode collectives on the native latency path.",
+      "Select bandwidth-oriented compression only above a measured payload crossover.",
+      "Avoid barriers, communicator discovery, and diagnostic bookkeeping on the critical path."
+    ],
+    "not_ported": "The paper's LL/sentinel/symmetric-memory kernels target NCCL device APIs and NVLink-scale-up systems; this host is four PCIe SM120 GPUs using PyNCCL, with symmetric-memory/custom-allreduce paths unavailable."
+  },
+  "environment": {
+    "base_image": "vllm/vllm-openai:nightly-x86_64",
+    "base_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "deployment_image": "every-us-matters-vllm:wheel-ar-tested",
+    "deployment_image_id": "sha256:a409b9a101b642db7475e3b86e3a52b474e4241759711904726992141c77ac6e",
+    "source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": [12, 0],
+    "tensor_parallel_size": 4,
+    "collective_backend": "PYNCCL",
+    "attention_backend": "FLASHINFER",
+    "moe_backend": "FLASHINFER_CUTLASS"
+  },
+  "protocol": {
+    "dummy_seed": 1234,
+    "warmup": 1,
+    "iterations": 3,
+    "input_tokens": [10000, 20000],
+    "output_tokens": 512,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 2048,
+    "compile_mode": 3,
+    "cudagraph_mode": "NONE",
+    "qk_norm_rope_fusion": true,
+    "kv_cache_dtype": "fp8_e4m3",
+    "prefix_caching": false,
+    "timing": "CUDA events around model forward plus logits; rank-max; wall time around end-to-end generation",
+    "prompt_salts": "unique deterministic measurement prompts"
+  },
+  "stock_vllm": {
+    "flags": {
+      "VLLM_FP8_ALL_REDUCE": "0",
+      "VLLM_SHARDED_DOWNSTREAM": "0",
+      "native_overlap": "off"
+    },
+    "results": {
+      "10000": {
+        "prefill_ms": 2081.6755762398243,
+        "prefill_tokens_per_second": 4803.822514007306,
+        "decode_ms": 23558.99782192707,
+        "decode_tokens_per_second": 21.732673175234396,
+        "wall_ms": 26050.23395898752,
+        "end_to_end_generated_tokens_per_second": 19.654334038077085
+      },
+      "20000": {
+        "prefill_ms": 4399.206072866917,
+        "prefill_tokens_per_second": 4546.274866129699,
+        "decode_ms": 23739.131411135197,
+        "decode_tokens_per_second": 21.56776468071779,
+        "wall_ms": 28642.57897999293,
+        "end_to_end_generated_tokens_per_second": 17.87548531707414
+      }
+    }
+  },
+  "optimized_vllm": {
+    "flags": {
+      "VLLM_FP8_ALL_REDUCE": "1",
+      "VLLM_FP8_ALL_REDUCE_MIN_BYTES": 3145728,
+      "VLLM_FP8_ALL_REDUCE_STATS": "0",
+      "VLLM_SHARDED_DOWNSTREAM": "0",
+      "native_overlap": "off"
+    },
+    "implementation": [
+      "Large contiguous BF16 reductions use the existing FP8 E4M3 compressed collective.",
+      "Sub-threshold reductions return directly to vLLM's native all-reduce entry point before communicator/capability/policy work.",
+      "Feature configuration and threshold are cached once per worker process.",
+      "Diagnostic counters are opt-in and disabled for performance runs.",
+      "Native fuse_allreduce_rms was isolated but not selected because it added decode latency on this workload."
+    ],
+    "results": {
+      "10000": {
+        "prefill_ms": 1367.7129891216755,
+        "prefill_tokens_per_second": 7311.475491961108,
+        "decode_ms": 23360.858424454927,
+        "decode_tokens_per_second": 21.917002821438327,
+        "wall_ms": 25176.1909990261,
+        "end_to_end_generated_tokens_per_second": 20.336674440538122
+      },
+      "20000": {
+        "prefill_ms": 2964.889890819788,
+        "prefill_tokens_per_second": 6745.613070463816,
+        "decode_ms": 23491.20468148589,
+        "decode_tokens_per_second": 21.79539137911996,
+        "wall_ms": 26906.983869033866,
+        "end_to_end_generated_tokens_per_second": 19.02851700109129
+      }
+    }
+  },
+  "optimized_vs_stock_percent": {
+    "10000": {
+      "prefill_tokens_per_second": 52.201200,
+      "decode_tokens_per_second": 0.848168,
+      "wall_ms": -3.355221,
+      "end_to_end_generated_tokens_per_second": 3.471705
+    },
+    "20000": {
+      "prefill_tokens_per_second": 48.376710,
+      "decode_tokens_per_second": 1.055402,
+      "wall_ms": -6.059493,
+      "end_to_end_generated_tokens_per_second": 6.450352
+    }
+  },
+  "correctness": "The bypass is stock all-reduce for every sub-threshold decode tensor. Large-payload FP8 correctness remains covered by the isolated A/B: model-sample max absolute error 1.01327896e-06; native RMSNorm fusion was separately exact on the captured 256-logit sample."
+}

@@ -1,0 +1,208 @@
+{
+  "hardware": {
+    "count": 4,
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": [
+      12,
+      0
+    ]
+  },
+  "protocol": {
+    "tensor_parallel_size": 4,
+    "warmup": 5,
+    "iterations": 100,
+    "dummy_seed": 1234,
+    "timing": "CUDA events around model forward plus logits, maximum mean rank latency",
+    "workloads": [
+      {
+        "phase": "prefill",
+        "batch": 32,
+        "context": 16,
+        "tokens_per_iteration": 512
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 16,
+        "tokens_per_iteration": 1
+      },
+      {
+        "phase": "prefill",
+        "batch": 4,
+        "context": 512,
+        "tokens_per_iteration": 2048
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 2048,
+        "tokens_per_iteration": 1
+      }
+    ]
+  },
+  "nanovllm": {
+    "environment": {
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0"
+    },
+    "configuration": {
+      "layers": 62,
+      "experts": 256,
+      "experts_per_token": 8,
+      "attention_weights": "NVFP4",
+      "expert_weights": "NVFP4",
+      "kv_cache": "BF16",
+      "compressed_collectives": "FP8 above 3 MiB"
+    },
+    "allocated_bytes_per_rank": 32757739520,
+    "results": [
+      {
+        "phase": "prefill",
+        "batch": 32,
+        "context": 16,
+        "latency_ms": 201.10552734375,
+        "tokens_per_second": 2545.9270402092807
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 16,
+        "latency_ms": 176.10951171875,
+        "tokens_per_second": 5.6782850070984106
+      },
+      {
+        "phase": "prefill",
+        "batch": 4,
+        "context": 512,
+        "latency_ms": 455.2167578125,
+        "tokens_per_second": 4498.955640037211
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 2048,
+        "latency_ms": 173.862578125,
+        "tokens_per_second": 5.751668995044128
+      }
+    ]
+  },
+  "vllm_controlled": {
+    "environment": {
+      "image": "vllm/vllm-openai:nightly-x86_64",
+      "digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+      "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0"
+    },
+    "configuration": {
+      "layers": 62,
+      "experts": 256,
+      "experts_per_token": 8,
+      "attention_weights": "NVFP4",
+      "expert_weights": "NVFP4",
+      "kv_cache": "BF16",
+      "attention_backend": "FlashInfer",
+      "moe_backend": "FlashInfer-CUTLASS",
+      "compilation": {
+        "mode": 3,
+        "cudagraph_mode": "NONE",
+        "enable_qk_norm_rope_fusion": true
+      }
+    },
+    "allocated_bytes_per_rank": 34529724928,
+    "results": [
+      {
+        "phase": "prefill",
+        "batch": 32,
+        "context": 16,
+        "latency_ms": 109.04775979995728,
+        "tokens_per_second": 4695.19044627087,
+        "speedup_over_nanovllm": 1.8441967786653128
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 16,
+        "latency_ms": 65.21995027184487,
+        "tokens_per_second": 15.332731715247798,
+        "speedup_over_nanovllm": 2.700239895686882
+      },
+      {
+        "phase": "prefill",
+        "batch": 4,
+        "context": 512,
+        "latency_ms": 398.6084085765481,
+        "tokens_per_second": 5137.874555415219,
+        "speedup_over_nanovllm": 1.1420149400212187
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 2048,
+        "latency_ms": 65.95881680727005,
+        "tokens_per_second": 15.16097541473453,
+        "speedup_over_nanovllm": 2.6359262724954866
+      }
+    ]
+  },
+  "vllm_published": {
+    "environment": {
+      "image": "vllm/vllm-openai:nightly-x86_64",
+      "digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+      "vllm": "0.23.1rc1.dev1502+g1240c74c0",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0"
+    },
+    "configuration": {
+      "source": "nvidia/MiniMax-M2.7-NVFP4",
+      "layers": 62,
+      "experts": 256,
+      "experts_per_token": 8,
+      "attention_weights": "BF16",
+      "expert_weights": "NVFP4",
+      "kv_cache": "FP8 E4M3",
+      "attention_backend": "FlashInfer",
+      "moe_backend": "FlashInfer-CUTLASS",
+      "compilation": {
+        "mode": 3,
+        "cudagraph_mode": "NONE",
+        "enable_qk_norm_rope_fusion": true
+      }
+    },
+    "allocated_bytes_per_rank": 35898358784,
+    "results": [
+      {
+        "phase": "prefill",
+        "batch": 32,
+        "context": 16,
+        "latency_ms": 109.36531400442124,
+        "tokens_per_second": 4681.557444980241,
+        "speedup_over_nanovllm": 1.8388419507086136
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 16,
+        "latency_ms": 45.287964102029804,
+        "tokens_per_second": 22.080921936501447,
+        "speedup_over_nanovllm": 3.888660380537106
+      },
+      {
+        "phase": "prefill",
+        "batch": 4,
+        "context": 512,
+        "latency_ms": 406.428414362371,
+        "tokens_per_second": 5039.017764574911,
+        "speedup_over_nanovllm": 1.120041664721378
+      },
+      {
+        "phase": "decode",
+        "batch": 1,
+        "context": 2048,
+        "latency_ms": 45.81491937607527,
+        "tokens_per_second": 21.82695099365828,
+        "speedup_over_nanovllm": 3.7948899723654588
+      }
+    ]
+  }
+}
