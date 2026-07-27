@@ -150,10 +150,9 @@ class Attention(nn.Module):
                 self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                     _flashinfer_workspace(q.device), kv_layout="NHD"
                 )
-            q_offsets = context.cu_seqlens_q.detach().cpu().tolist()
             k_lengths = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]).detach().cpu().tolist()
             indices, kv_offsets, last_page_len = [], [0], []
-            page_size = k_cache_page = self.k_cache.shape[1]
+            page_size = self.k_cache.shape[1]
             for row, length in zip(context.block_tables, k_lengths):
                 pages = (length + page_size - 1) // page_size
                 indices.append(row[:pages])
