@@ -62,10 +62,13 @@ def time_forward(run, tokens: int, warmup: int, iterations: int) -> dict:
     if output is not None:
         assert torch.isfinite(output).all()
     latency_ms = rank_max(start.elapsed_time(end) / iterations)
+    collective = stats()
+    for key in ("compressed_calls", "fallback_calls", "input_bytes", "payload_bytes"):
+        collective[key] //= iterations
     return {
         "latency_ms": latency_ms,
         "tokens_per_second": tokens * 1000 / latency_ms,
-        "collective": stats(),
+        "collective": collective,
     }
 
 
@@ -155,9 +158,10 @@ def parse_args():
 def run(args) -> None:
     os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
     os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
-    dist.init_process_group("nccl")
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     rank = dist.get_rank()
-    torch.cuda.set_device(int(os.getenv("LOCAL_RANK", rank)))
     config = PretrainedConfig.from_dict(json.loads(args.config.read_text()))
     torch.set_default_dtype(config.dtype)
     torch.set_default_device("cuda")
