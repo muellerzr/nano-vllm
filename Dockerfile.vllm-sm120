@@ -1,0 +1,9 @@
+ARG VLLM_BASE=vllm/vllm-openai:nightly-x86_64@sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d
+FROM ${VLLM_BASE}
+
+COPY patches/flashinfer-trtllm-sm120.patch /tmp/flashinfer-trtllm-sm120.patch
+RUN cd /usr/local/lib/python3.12/dist-packages \
+    && patch --dry-run -p1 < /tmp/flashinfer-trtllm-sm120.patch \
+    && patch -p1 < /tmp/flashinfer-trtllm-sm120.patch
+RUN FLASHINFER_CUDA_ARCH_LIST=12.0f FLASHINFER_JIT_DEBUG=0 python3 -c \
+    'import shutil; from flashinfer.jit.comm import gen_trtllm_comm_module; spec = gen_trtllm_comm_module(); spec.build(False); shutil.copy2(spec.jit_library_path, spec.aot_path)'

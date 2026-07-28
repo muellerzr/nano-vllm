@@ -351,14 +351,15 @@ def make_prompt(length: int, vocab_size: int) -> list[int]:
 def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: int, vocab_size: int) -> dict:
     def once(salt: int):
         run_prompts = [[(token + salt) % vocab_size for token in prompt] for prompt in prompts]
+        start = perf_counter()
         for prompt in run_prompts:
             llm.add_request(prompt, sampling_params)
         prefill_seconds = decode_seconds = 0.0
+        first_token_seconds = None
         prefill_tokens = decode_tokens = 0
-        start = perf_counter()
         while not llm.is_finished():
             step_start = perf_counter()
-            _, scheduled = llm.step()
+            outputs, scheduled = llm.step()
             elapsed = perf_counter() - step_start
             if scheduled > 0:
                 prefill_tokens += scheduled
@@ -366,14 +367,20 @@ def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: i
             else:
                 decode_tokens += -scheduled
                 decode_seconds += elapsed
-        return perf_counter() - start, prefill_tokens, prefill_seconds, decode_tokens, decode_seconds
+            if first_token_seconds is None:
+                running = any(seq.num_completion_tokens for seq in llm.scheduler.running)
+                finished = any(token_ids for _, token_ids in outputs)
+                if running or finished:
+                    first_token_seconds = perf_counter() - start
+        return perf_counter() - start, first_token_seconds, prefill_tokens, prefill_seconds, decode_tokens, decode_seconds
 
     for index in range(warmup):
         once(7919 + index)
     samples = [once(100000 + index) for index in range(iterations)]
     wall = sum(x[0] for x in samples) / iterations
-    prefill_s = sum(x[2] for x in samples) / iterations
-    decode_s = sum(x[4] for x in samples) / iterations
+    ttft_s = sum(x[1] for x in samples if x[1] is not None) / iterations
+    prefill_s = sum(x[3] for x in samples) / iterations
+    decode_s = sum(x[5] for x in samples) / iterations
     prompt_tokens = len(prompts) * len(prompts[0])
     generated_tokens = len(prompts) * sampling_params.max_tokens
     return {
@@ -381,6 +388,7 @@ def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: i
         "input_tokens": len(prompts[0]),
         "output_tokens": sampling_params.max_tokens,
         "wall_ms": wall * 1000,
+        "ttft_ms": ttft_s * 1000,
         "prefill_ms": prefill_s * 1000,
         "decode_ms": decode_s * 1000,
         "prefill_tokens": prompt_tokens,

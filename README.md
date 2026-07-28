@@ -44,3 +44,14 @@ python benchmarks/reproduce_minimal_patch.py \
 
 The reproduction uses deterministic synthetic weights with seed 1234 and does
 not download model weights.
+
+The pinned vLLM comparison image can be built with:
+
+```bash
+docker build -f Dockerfile.vllm-sm120 -t vllm-sm120 .
+```
+
+Set `VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm` and use
+`fuse_allreduce_rms=true`, `fi_allreduce_fusion_max_size_mb=0.005859375`, and
+`compile_ranges_endpoints=[1, 2048]`. The fused SM120 path is limited to
+single-token decode; larger batches retain vLLM's stock collective.
