@@ -1,0 +1,158 @@
+{
+  "protocol": {
+    "image": "vllm/vllm-openai:nightly-x86_64",
+    "image_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "vllm_version": "0.23.1rc1.dev1502+g1240c74c0",
+    "vllm_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "flashinfer_version": "0.6.15.post1",
+    "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "compute_capability": "sm_120f",
+    "tensor_parallel_size": 4,
+    "weights": "deterministic dummy/synthetic",
+    "seed": 1234,
+    "input_tokens": 10000,
+    "output_tokens": 512,
+    "num_prompts": "equal to concurrency",
+    "warmup": "one matched request set with 64 output tokens",
+    "prefix_caching": false,
+    "kv_cache_dtype": "fp8",
+    "attention_backend": "flashinfer",
+    "moe_backend": "flashinfer-cutlass",
+    "compile_mode": 3,
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "cudagraph_capture_sizes": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "compile_ranges_endpoints": [
+      1,
+      2048
+    ],
+    "max_num_batched_tokens": 2048,
+    "max_num_seqs": 16
+  },
+  "sm120_allreduce_rms": {
+    "backend": "trtllm",
+    "dtype": "bfloat16",
+    "hidden_size": 3072,
+    "max_tokens": 1,
+    "max_payload_bytes": 6144,
+    "max_payload_mib": 0.005859375,
+    "use_oneshot": true,
+    "cuda_graph_replay_validated": true,
+    "max_abs_error_bound": 0.125,
+    "token_1_microbenchmark": {
+      "stock_allreduce_plus_rms_ms": 0.0690989,
+      "fused_ms": 0.0640989,
+      "speedup": 1.078
+    },
+    "fallback": "stock vLLM for two or more tokens"
+  },
+  "single_user_ab": {
+    "stock": {
+      "off": {
+        "mean_ttft_ms": 2100.4401853333334,
+        "mean_tpot_ms": 8.75679765101109,
+        "mean_e2el_ms": 6575.163785000001,
+        "decode_tokens_per_second": 114.19699756160709,
+        "output_throughput": 77.86790911031528
+      },
+      "on": {
+        "mean_ttft_ms": 2100.0956656666667,
+        "mean_tpot_ms": 7.718247962165688,
+        "mean_e2el_ms": 6044.120374333334,
+        "decode_tokens_per_second": 129.563082826819,
+        "output_throughput": 84.70933418823729
+      }
+    },
+    "tuned": {
+      "off": {
+        "mean_ttft_ms": 1387.3431386666668,
+        "mean_tpot_ms": 8.79153430658839,
+        "mean_e2el_ms": 5879.817169333333,
+        "decode_tokens_per_second": 113.74578829210714,
+        "output_throughput": 87.0764944110106
+      },
+      "on": {
+        "mean_ttft_ms": 1386.6243303333335,
+        "mean_tpot_ms": 7.758029082191781,
+        "mean_e2el_ms": 5350.9771913333325,
+        "decode_tokens_per_second": 128.89871762603426,
+        "output_throughput": 95.68213255750992
+      }
+    }
+  },
+  "concurrency": {
+    "stock_sm120": {
+      "2": {
+        "mean_ttft_ms": 3175.8456260000003,
+        "mean_tpot_ms": 11.348827253424657,
+        "mean_e2el_ms": 8975.096352499999,
+        "output_throughput": 113.84684881274828,
+        "output_throughput_per_user": 56.92342440637414,
+        "total_token_throughput": 2337.418114686738
+      },
+      "4": {
+        "mean_ttft_ms": 5318.04983475,
+        "mean_tpot_ms": 16.125846228962818,
+        "mean_e2el_ms": 13558.35725775,
+        "output_throughput": 150.33276042007702,
+        "output_throughput_per_user": 37.583190105019255,
+        "total_token_throughput": 3086.519487374706
+      },
+      "8": {
+        "mean_ttft_ms": 9620.508787875,
+        "mean_tpot_ms": 26.621512319960864,
+        "mean_e2el_ms": 23224.101583375003,
+        "output_throughput": 175.07588871486846,
+        "output_throughput_per_user": 21.884486089358558,
+        "total_token_throughput": 3594.5268401771427
+      },
+      "16": {
+        "mean_ttft_ms": 18102.8477074375,
+        "mean_tpot_ms": 45.624971618639925,
+        "mean_e2el_ms": 41417.20820456249,
+        "output_throughput": 195.77421165313524,
+        "output_throughput_per_user": 12.235888228320953,
+        "total_token_throughput": 4019.489283003433
+      }
+    },
+    "tuned_sm120": {
+      "2": {
+        "mean_ttft_ms": 2094.2116275,
+        "mean_tpot_ms": 10.659854131115459,
+        "mean_e2el_ms": 7541.3970885,
+        "output_throughput": 135.44222037722466,
+        "output_throughput_per_user": 67.72111018861233,
+        "total_token_throughput": 2780.7980871198934
+      },
+      "4": {
+        "mean_ttft_ms": 3504.5184235,
+        "mean_tpot_ms": 14.066705490704502,
+        "mean_e2el_ms": 10692.604929250001,
+        "output_throughput": 190.3892756646766,
+        "output_throughput_per_user": 47.59731891616915,
+        "total_token_throughput": 3908.9298159903915
+      },
+      "8": {
+        "mean_ttft_ms": 6331.13808125,
+        "mean_tpot_ms": 21.795221804060667,
+        "mean_e2el_ms": 17468.496423125,
+        "output_throughput": 232.20440748181326,
+        "output_throughput_per_user": 29.025550935226657,
+        "total_token_throughput": 4767.446741110979
+      },
+      "16": {
+        "mean_ttft_ms": 11894.7971199375,
+        "mean_tpot_ms": 35.044731586961845,
+        "mean_e2el_ms": 29802.654960875003,
+        "output_throughput": 270.99638011907655,
+        "output_throughput_per_user": 16.937273757442285,
+        "total_token_throughput": 5563.894429319791
+      }
+    }
+  }
+}
