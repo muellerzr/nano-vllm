@@ -1,0 +1,44 @@
+{
+  "protocol": {
+    "backend": "openai-chat",
+    "endpoint": "/v1/chat/completions",
+    "dataset": "random",
+    "input_tokens": 10000,
+    "output_tokens": 512,
+    "num_prompts": 2,
+    "max_concurrency": 2,
+    "seed": 1234,
+    "prefix_caching": false,
+    "tensor_parallel_size": 4,
+    "weights": "deterministic dummy/synthetic"
+  },
+  "cuda_graphs": {
+    "mode": "FULL_AND_PIECEWISE",
+    "capture_sizes": [1, 2]
+  },
+  "results": {
+    "stock": {
+      "mean_ttft_ms": 2827.628263,
+      "mean_tpot_ms": 11.160081,
+      "mean_itl_ms": 11.138272,
+      "mean_e2el_ms": 8530.4298295,
+      "output_throughput": 119.928715,
+      "total_token_throughput": 2462.286435
+    },
+    "tuned": {
+      "mean_ttft_ms": 2426.227264,
+      "mean_tpot_ms": 9.356827,
+      "mean_itl_ms": 9.338537,
+      "mean_e2el_ms": 7207.566096,
+      "output_throughput": 142.071166,
+      "total_token_throughput": 2916.898622
+    }
+  },
+  "tuned_flags": {
+    "fp8_all_reduce": true,
+    "fp8_all_reduce_min_bytes": 3145728,
+    "fuse_allreduce_rms_requested": true,
+    "fuse_allreduce_rms_active": false,
+    "fuse_allreduce_rms_disable_reason": "FlashInfer capability table has no SM120 entry for TP4"
+  }
+}
