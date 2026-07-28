@@ -1,60 +1,12 @@
 import torch
-import os
 from torch import nn
 import triton
 import triton.language as tl
+import flashinfer
 
 from nanovllm.utils.context import get_context
 
-try:
-    import flashinfer
-except ImportError:
-    flashinfer = None
-
 _FLASHINFER_WORKSPACES = {}
-_ATTENTION_HANDLES = {}
-
-
-def _flashinfer_attention_op(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    attention_handle: int,
-) -> None:
-    context = get_context()
-    if attention_handle not in _ATTENTION_HANDLES:
-        raise RuntimeError(f"unknown Nano attention handle {attention_handle}")
-    if context.is_prefill:
-        result = context.flashinfer_prefill.run(query, key, value, out=output)
-    else:
-        result = context.flashinfer_decode.run(query, key, value, out=output)
-    if result is not output:
-        output.copy_(result[0] if isinstance(result, (tuple, list)) else result)
-
-
-def _flashinfer_attention_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    attention_handle: int,
-) -> None:
-    del query, key, value, output, attention_handle
-
-
-try:
-    from vllm.utils.torch_utils import direct_register_custom_op
-
-    direct_register_custom_op(
-        op_name="nanovllm_flashinfer_attention",
-        op_func=_flashinfer_attention_op,
-        mutates_args=["output"],
-        fake_impl=_flashinfer_attention_fake,
-    )
-    _FLASHINFER_CUSTOM_OP = torch.ops.vllm.nanovllm_flashinfer_attention
-except (ImportError, AttributeError, RuntimeError):
-    _FLASHINFER_CUSTOM_OP = None
 
 
 def _flashinfer_workspace(device):
@@ -66,7 +18,6 @@ def _flashinfer_workspace(device):
 
 
 class _FlashInferDecodeState:
-    """One planned paged-decode execution shared by all decoder layers."""
 
     def __init__(self, wrapper):
         self.wrapper = wrapper
@@ -76,7 +27,6 @@ class _FlashInferDecodeState:
 
 
 class _FlashInferPrefillState:
-    """One planned paged-prefill execution shared by all decoder layers."""
 
     def __init__(self, wrapper, paged: bool):
         self.wrapper = wrapper
@@ -89,7 +39,6 @@ class _FlashInferPrefillState:
 
 
 def _paged_layout(block_tables: torch.Tensor, lengths: torch.Tensor, page_size: int):
-    """Build FlashInfer's compact page layout without GPU-to-CPU round trips."""
     pages = (lengths + page_size - 1) // page_size
     max_pages = block_tables.shape[1]
     page_numbers = torch.arange(max_pages, device=block_tables.device, dtype=torch.int32)
@@ -111,33 +60,25 @@ def make_flashinfer_decode_state(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     scale: float,
-    backend: str = "auto",
 ):
-    if flashinfer is None or backend not in ("auto", "flashinfer"):
-        return None
-    try:
-        indptr, indices, last_page_len = _paged_layout(block_tables, context_lens, page_size)
-        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            _flashinfer_workspace(block_tables.device), kv_layout="NHD", use_tensor_cores=True
-        )
-        wrapper.plan(
-            indptr,
-            indices,
-            last_page_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-            o_data_type=q_dtype,
-            sm_scale=scale,
-        )
-        return _FlashInferDecodeState(wrapper)
-    except Exception:
-        if backend == "flashinfer":
-            raise
-        return None
+    indptr, indices, last_page_len = _paged_layout(block_tables, context_lens, page_size)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        _flashinfer_workspace(block_tables.device), kv_layout="NHD", use_tensor_cores=True
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        o_data_type=q_dtype,
+        sm_scale=scale,
+    )
+    return _FlashInferDecodeState(wrapper)
 
 
 def make_flashinfer_prefill_state(
@@ -152,57 +93,47 @@ def make_flashinfer_prefill_state(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     scale: float,
-    backend: str = "auto",
 ):
-    if flashinfer is None:
-        raise RuntimeError("FlashInfer is required by the minimal MiniMax engine")
-    if backend not in ("auto", "flashinfer"):
-        raise RuntimeError(f"Unsupported attention backend: {backend}")
-    try:
-        if block_tables is None:
-            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-                _flashinfer_workspace(cu_seqlens_q.device), kv_layout="NHD"
-            )
-            wrapper.plan(
-                cu_seqlens_q,
-                cu_seqlens_k,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                head_dim,
-                causal=True,
-                sm_scale=scale,
-                q_data_type=q_dtype,
-                # Ragged prefill consumes freshly projected BF16 K/V; only
-                # paged-cache attention reads the configured FP8 KV cache.
-                kv_data_type=q_dtype,
-                o_data_type=q_dtype,
-            )
-            return _FlashInferPrefillState(wrapper, paged=False)
-        k_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        paged_indptr, paged_indices, last_page_len = _paged_layout(block_tables, k_lengths, page_size)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            _flashinfer_workspace(block_tables.device), kv_layout="NHD"
+    if block_tables is None:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            _flashinfer_workspace(cu_seqlens_q.device), kv_layout="NHD"
         )
         wrapper.plan(
             cu_seqlens_q,
-            paged_indptr,
-            paged_indices,
-            last_page_len,
+            cu_seqlens_k,
             num_heads,
             num_kv_heads,
             head_dim,
-            page_size,
             head_dim,
             causal=True,
             sm_scale=scale,
             q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
+            kv_data_type=q_dtype,
             o_data_type=q_dtype,
         )
-        return _FlashInferPrefillState(wrapper, paged=True)
-    except Exception:
-        raise
+        return _FlashInferPrefillState(wrapper, paged=False)
+    k_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    paged_indptr, paged_indices, last_page_len = _paged_layout(block_tables, k_lengths, page_size)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        _flashinfer_workspace(block_tables.device), kv_layout="NHD"
+    )
+    wrapper.plan(
+        cu_seqlens_q,
+        paged_indptr,
+        paged_indices,
+        last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        head_dim,
+        causal=True,
+        sm_scale=scale,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        o_data_type=q_dtype,
+    )
+    return _FlashInferPrefillState(wrapper, paged=True)
 
 
 @triton.jit
@@ -235,10 +166,6 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    # vLLM's published deployment stores K/V as FP8 E4M3 with scale=1.0.
-    # The scatter kernel writes through the cache pointer, so Triton performs
-    # the conversion in the same kernel (rather than launching a separate
-    # cast for every layer and decode token).
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -257,11 +184,6 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
-        self._attention_handle = id(self)
-        _ATTENTION_HANDLES[self._attention_handle] = self
-        backend = os.getenv("NANOVLLM_ATTENTION_BACKEND", "flashinfer")
-        self.attention_backend = backend
-        self.flashinfer = flashinfer if backend in ("auto", "flashinfer") else None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -271,23 +193,11 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.flashinfer_prefill is None:
                 raise RuntimeError("prefill FlashInfer state was not prepared")
-            if context.block_tables is not None:    # prefix cache
+            if context.block_tables is not None:
                 k, v = k_cache, v_cache
-            if os.getenv("NANOVLLM_TORCH_COMPILE", "0") == "1":
-                if _FLASHINFER_CUSTOM_OP is None:
-                    raise RuntimeError("vLLM FlashInfer custom op is unavailable")
-                o = torch.empty_like(q)
-                _FLASHINFER_CUSTOM_OP(q, k, v, o, self._attention_handle)
-            else:
-                o = context.flashinfer_prefill.run(q, k, v)
+            o = context.flashinfer_prefill.run(q, k, v)
         else:
             if context.flashinfer_decode is None:
                 raise RuntimeError("decode FlashInfer state was not prepared")
-            if os.getenv("NANOVLLM_TORCH_COMPILE", "0") == "1":
-                if _FLASHINFER_CUSTOM_OP is None:
-                    raise RuntimeError("vLLM FlashInfer custom op is unavailable")
-                o = torch.empty_like(q)
-                _FLASHINFER_CUSTOM_OP(q, k_cache, v_cache, o, self._attention_handle)
-            else:
-                o = context.flashinfer_decode.run(q, k_cache, v_cache)
+            o = context.flashinfer_decode.run(q, k_cache, v_cache)
         return o

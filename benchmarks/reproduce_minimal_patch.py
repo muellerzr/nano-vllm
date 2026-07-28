@@ -9,7 +9,6 @@ import os
 import platform
 import socket
 import subprocess
-import uuid
 from time import perf_counter
 from pathlib import Path
 
@@ -17,12 +16,20 @@ import torch
 import torch.distributed as dist
 from transformers import PretrainedConfig
 
-from nanovllm.layers.compressed_collective import all_reduce, reset_stats, stats
-from nanovllm.layers.attention import make_flashinfer_decode_state, make_flashinfer_prefill_state
+from nanovllm.layers.compressed_collective import (
+    all_reduce,
+    configure,
+    reset_stats,
+    stats,
+)
+from nanovllm.layers.attention import (
+    make_flashinfer_decode_state,
+    make_flashinfer_prefill_state,
+)
 from nanovllm.models.minimax_m2 import MiniMaxM2ForCausalLM
+from nanovllm.layers.minimax_rms_norm import qk_rms_norm, reset_qk_norm
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.context import reset_context, set_context
-from nanovllm.utils.compile import maybe_compile
 
 
 CASES = (("prefill", 32, 16), ("decode", 1, 16), ("prefill", 4, 512), ("decode", 1, 2048))
@@ -44,25 +51,15 @@ def source_revision() -> str:
         return "container-source"
 
 
-def runtime_metadata() -> dict:
-    try:
-        import vllm
-
-        vllm_version = getattr(vllm, "__version__", "unknown")
-    except ImportError:
-        vllm_version = "unavailable"
+def runtime_metadata(args, compressed: bool) -> dict:
     return {
-        "attention_backend": os.getenv("NANOVLLM_ATTENTION_BACKEND", "flashinfer"),
-        "qk_norm_backend": os.getenv("NANOVLLM_QK_NORM_BACKEND", "vllm"),
-        "all_reduce_backend": os.getenv("NANOVLLM_ALL_REDUCE_BACKEND", "vllm"),
-        "fp8_all_reduce": os.getenv("NANOVLLM_FP8_ALL_REDUCE", "0"),
-        "fp8_all_reduce_min_bytes": int(os.getenv("NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES", str(3 * 1024 * 1024))),
-        "kv_cache_dtype": os.getenv("NANOVLLM_KV_CACHE_DTYPE", "bf16"),
-        "image_digest": os.getenv("NANOVLLM_IMAGE_DIGEST", PINNED_VLLM_IMAGE_DIGEST),
-        "torch_compile": os.getenv("NANOVLLM_TORCH_COMPILE", "0"),
-        "torch_compile_mode": os.getenv("NANOVLLM_TORCH_COMPILE_MODE", "default"),
-        "vllm_version": vllm_version,
-        "vllm_source_commit": os.getenv("NANOVLLM_VLLM_COMMIT", PINNED_VLLM_COMMIT),
+        "attention_backend": "flashinfer",
+        "all_reduce_backend": "pynccl",
+        "fp8_all_reduce": compressed,
+        "fp8_all_reduce_min_bytes": args.min_bytes,
+        "kv_cache_dtype": "fp8",
+        "image_digest": PINNED_VLLM_IMAGE_DIGEST,
+        "vendor_source_commit": PINNED_VLLM_COMMIT,
     }
 
 
@@ -110,7 +107,14 @@ def time_forward(run, tokens: int, warmup: int, iterations: int) -> dict:
     }
 
 
-def attach_kv_cache(model, config, batch: int, context: int, block_size: int):
+def attach_kv_cache(
+    model,
+    config,
+    batch: int,
+    context: int,
+    block_size: int,
+    cache_dtype: torch.dtype,
+):
     world = dist.get_world_size()
     blocks_per_sequence = math.ceil(context / block_size)
     cache = torch.zeros(
@@ -120,7 +124,7 @@ def attach_kv_cache(model, config, batch: int, context: int, block_size: int):
         block_size,
         config.num_key_value_heads // world,
         config.head_dim,
-        dtype=config.dtype,
+        dtype=cache_dtype,
         device="cuda",
     )
     layer = 0
@@ -147,13 +151,20 @@ def case(model, config, phase: str, batch: int, context: int, args) -> dict:
             q_dtype=config.dtype,
             kv_dtype=config.dtype,
             scale=config.head_dim ** -0.5,
-            backend="flashinfer",
         )
         set_context(True, cu, cu, context, context, flashinfer_prefill=fi_prefill)
         cleanup = None
         tokens = batch * context
     else:
-        cache, tables, slots = attach_kv_cache(model, config, batch, context, args.block_size)
+        cache_dtype = torch.float8_e4m3fn
+        cache, tables, slots = attach_kv_cache(
+            model,
+            config,
+            batch,
+            context,
+            args.block_size,
+            cache_dtype,
+        )
         input_ids = torch.zeros(batch, dtype=torch.int64, device="cuda")
         positions = torch.full((batch,), context - 1, dtype=torch.int64, device="cuda")
         lengths = torch.full((batch,), context, dtype=torch.int32, device="cuda")
@@ -164,9 +175,8 @@ def case(model, config, phase: str, batch: int, context: int, args) -> dict:
             head_dim=config.head_dim,
             page_size=args.block_size,
             q_dtype=config.dtype,
-            kv_dtype=config.dtype,
+            kv_dtype=cache_dtype,
             scale=config.head_dim ** -0.5,
-            backend="flashinfer",
         )
         set_context(False, slot_mapping=slots, context_lens=lengths, block_tables=tables,
                     flashinfer_decode=fi_decode)
@@ -204,13 +214,91 @@ def validate_collective(args) -> dict:
     source = torch.randn(elements, dtype=torch.bfloat16, device="cuda")
     reference = source.clone()
     dist.all_reduce(reference)
-    os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1"
+    configure(True, args.min_bytes, True)
     candidate = source.clone()
     all_reduce(candidate)
     error = (candidate.float() - reference.float()).abs()
     mean_relative = error.mean() / reference.float().abs().mean().clamp_min(1e-12)
     max_relative = error.max() / reference.float().abs().max().clamp_min(1e-12)
     return {"bytes": source.numel() * source.element_size(), "mean_relative_error": rank_max(mean_relative.item()), "max_relative_error": rank_max(max_relative.item()), "collective": stats()}
+
+
+def validate_qk_norm(args) -> dict:
+    torch.manual_seed(args.seed + dist.get_rank())
+    qkv = torch.randn(4, 2048, dtype=torch.bfloat16, device="cuda")
+    q_weight = torch.randn(1536, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn(256, dtype=torch.bfloat16, device="cuda")
+    q, k, _ = qkv.split((1536, 256, 256), dim=-1)
+    variance = torch.stack(
+        (
+            q.float().square().mean(-1),
+            k.float().square().mean(-1),
+        ),
+        dim=-1,
+    )
+    dist.all_reduce(variance)
+    reference_q = (
+        q.float()
+        * torch.rsqrt(variance[:, :1] / 4 + 1e-6)
+        * q_weight.float()
+    ).to(torch.bfloat16)
+    reference_k = (
+        k.float()
+        * torch.rsqrt(variance[:, 1:] / 4 + 1e-6)
+        * k_weight.float()
+    ).to(torch.bfloat16)
+    actual_q, actual_k = qk_rms_norm(
+        qkv,
+        q_weight,
+        k_weight,
+        1536,
+        256,
+        1e-6,
+    )
+    reset_qk_norm()
+    dist.barrier()
+    second_q, second_k = qk_rms_norm(
+        qkv,
+        q_weight,
+        k_weight,
+        1536,
+        256,
+        1e-6,
+    )
+    return {
+        "q_max_abs_error": rank_max(
+            (actual_q.float() - reference_q.float()).abs().max().item()
+        ),
+        "k_max_abs_error": rank_max(
+            (actual_k.float() - reference_k.float()).abs().max().item()
+        ),
+        "reinitialized_q_max_abs_error": rank_max(
+            (second_q.float() - reference_q.float()).abs().max().item()
+        ),
+        "reinitialized_k_max_abs_error": rank_max(
+            (second_k.float() - reference_k.float()).abs().max().item()
+        ),
+    }
+
+
+def validate_stock_collective_backends(rank: int) -> dict:
+    source = (
+        torch.arange(3072, device="cuda", dtype=torch.float32) + rank
+    ).to(torch.bfloat16).view(1, -1)
+    reference = source.clone()
+    dist.all_reduce(reference)
+    configure(False)
+    candidate = all_reduce(source.clone())
+    exact = torch.tensor(
+        int(torch.equal(reference, candidate)),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    dist.all_reduce(exact, op=dist.ReduceOp.MIN)
+    max_abs = rank_max(
+        float((candidate.float() - reference.float()).abs().max())
+    )
+    return {"exact": bool(exact.item()), "max_abs_error": max_abs}
 
 
 def parse_args():
@@ -293,15 +381,12 @@ def run_long_context(args) -> None:
     config = json.loads(args.config.read_text())
     if args.concurrency < 1:
         raise ValueError("--concurrency must be positive")
-    os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
-    os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
-    os.environ["NANOVLLM_SHM_NAME"] = f"nanovllm_{os.getpid()}_{uuid.uuid4().hex}"
     prompts = [make_prompt(args.input_tokens, config["vocab_size"]) for _ in range(args.concurrency)]
     params = SamplingParams(temperature=1.0, max_tokens=args.output_tokens, ignore_eos=True)
     model_dir = args.config.parent / "minimal_model"
     modes = ("baseline", "compressed") if args.mode == "both" else (args.mode,)
     for mode in modes:
-        os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1" if mode == "compressed" else "0"
+        compressed = mode == "compressed"
         llm = LLM(
             str(model_dir),
             load_format="dummy",
@@ -310,12 +395,14 @@ def run_long_context(args) -> None:
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.concurrency,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=True,
+            fp8_all_reduce=compressed,
+            fp8_all_reduce_min_bytes=args.min_bytes,
+            record_collective_stats=True,
         )
         result = measure_generation(llm, prompts, params, args.warmup, args.iterations, config["vocab_size"])
         result.update({"mode": mode, "source_revision": source_revision(), "seed": args.seed,
                        "world_size": args.world_size or 4, "warmup": args.warmup, "iterations": args.iterations,
-                       "config": str(args.config), "model": str(model_dir), **runtime_metadata()})
+                       "config": str(args.config), "model": str(model_dir), **runtime_metadata(args, compressed)})
         print(json.dumps({"event": "long_context_result", **result}, sort_keys=True), flush=True)
         llm.exit()
         del llm
@@ -327,8 +414,6 @@ def run(args) -> None:
     if args.profile == "long-context":
         run_long_context(args)
         return
-    os.environ["NANOVLLM_FP8_ALL_REDUCE_MIN_BYTES"] = str(args.min_bytes)
-    os.environ["NANOVLLM_FP8_ALL_REDUCE_STATS"] = "1"
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
@@ -345,12 +430,30 @@ def run(args) -> None:
     torch.set_default_device("cuda")
     model = MiniMaxM2ForCausalLM(config).eval()
     seed_weights(model, args.seed)
-    model = maybe_compile(model)
     torch.cuda.synchronize()
     dist.barrier()
+    peak_memory_bytes = int(rank_max(torch.cuda.max_memory_allocated()))
     if rank == 0:
-        print(json.dumps({"event": "metadata", "source_revision": source_revision(), "host": socket.gethostname(), "platform": platform.platform(), "torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(), "capability": list(torch.cuda.get_device_capability()), "world_size": dist.get_world_size(), "seed": args.seed, "warmup": args.warmup, "iterations": args.iterations, "min_bytes": args.min_bytes, "cases": selected_cases, **runtime_metadata()}, sort_keys=True), flush=True)
+        print(json.dumps({"event": "metadata", "source_revision": source_revision(), "host": socket.gethostname(), "platform": platform.platform(), "torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(), "capability": list(torch.cuda.get_device_capability()), "world_size": dist.get_world_size(), "seed": args.seed, "warmup": args.warmup, "iterations": args.iterations, "min_bytes": args.min_bytes, "peak_memory_bytes_per_rank": peak_memory_bytes, "cases": selected_cases, **runtime_metadata(args, False)}, sort_keys=True), flush=True)
     if not args.skip_validation:
+        qk_validation = validate_qk_norm(args)
+        if rank == 0:
+            print(
+                json.dumps(
+                    {"event": "qk_norm_validation", **qk_validation},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        stock_validation = validate_stock_collective_backends(rank)
+        if rank == 0:
+            print(
+                json.dumps(
+                    {"event": "stock_collective_validation", **stock_validation},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         validation = validate_collective(args)
         if rank == 0:
             print(json.dumps({"event": "collective_validation", **validation}, sort_keys=True), flush=True)
@@ -361,7 +464,7 @@ def run(args) -> None:
     modes = ("baseline", "compressed") if args.mode == "both" else (args.mode,)
     with torch.inference_mode():
         for mode in modes:
-            os.environ["NANOVLLM_FP8_ALL_REDUCE"] = "1" if mode == "compressed" else "0"
+            configure(mode == "compressed", args.min_bytes, True)
             for phase, batch, context in selected_cases:
                 result = case(model, config, phase, batch, context, args)
                 if rank == 0:

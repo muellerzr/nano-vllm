@@ -12,9 +12,6 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    # A single FlashInfer plan is prepared per model invocation and shared by
-    # every transformer layer.  Keeping it in the execution context avoids
-    # replanning the same batch 62 times for MiniMax-M2.
     flashinfer_decode: object | None = None
     flashinfer_prefill: object | None = None
 

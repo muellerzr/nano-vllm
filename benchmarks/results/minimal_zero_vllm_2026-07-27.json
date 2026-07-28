@@ -1,0 +1,104 @@
+{
+  "date": "2026-07-27",
+  "source_branch": "codex/minimal-vllm-patch",
+  "source_revision": "containing commit",
+  "vendor_source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+  "image": "vllm/vllm-openai:nightly-x86_64",
+  "image_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "flashinfer": "0.6.15.post1",
+  "device": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "capability": [
+    12,
+    0
+  ],
+  "world_size": 4,
+  "seed": 1234,
+  "warmup": 5,
+  "iterations": 100,
+  "peak_memory_bytes_per_rank": 33824080896,
+  "attention_backend": "flashinfer",
+  "moe_backend": "flashinfer_cutlass_nvfp4",
+  "all_reduce_backend": "pynccl",
+  "kv_cache_dtype": "fp8_e4m3",
+  "compressed_all_reduce_min_bytes": 3145728,
+  "correctness": {
+    "exact_bf16_all_reduce": true,
+    "exact_bf16_all_reduce_max_abs_error": 0.0,
+    "fused_q_max_abs_error": 0.0,
+    "fused_k_max_abs_error": 0.0,
+    "fused_q_reinitialized_max_abs_error": 0.0,
+    "fused_k_reinitialized_max_abs_error": 0.0,
+    "compressed_mean_relative_error": 0.021914536133408546,
+    "compressed_max_relative_error": 0.03030303120613098,
+    "compressed_input_bytes": 3145728,
+    "compressed_payload_bytes": 1622016
+  },
+  "forward": [
+    {
+      "phase": "prefill",
+      "batch": 32,
+      "context": 16,
+      "pinned_vllm_latency_ms": 109.3653,
+      "zero_vllm_baseline_latency_ms": 108.68099609375,
+      "zero_vllm_baseline_tokens_per_second": 4711.035216850059,
+      "zero_vllm_compressed_latency_ms": 77.5827978515625,
+      "zero_vllm_compressed_tokens_per_second": 6599.401080889073
+    },
+    {
+      "phase": "decode",
+      "batch": 1,
+      "context": 16,
+      "pinned_vllm_latency_ms": 45.288,
+      "zero_vllm_baseline_latency_ms": 43.3398876953125,
+      "zero_vllm_baseline_tokens_per_second": 23.073433116167415,
+      "zero_vllm_compressed_latency_ms": 43.9301025390625,
+      "zero_vllm_compressed_tokens_per_second": 22.763434233070665
+    },
+    {
+      "phase": "prefill",
+      "batch": 4,
+      "context": 512,
+      "pinned_vllm_latency_ms": 406.4284,
+      "zero_vllm_baseline_latency_ms": 402.8760546875,
+      "zero_vllm_baseline_tokens_per_second": 5083.449304497826,
+      "zero_vllm_compressed_latency_ms": 250.46537109375,
+      "zero_vllm_compressed_tokens_per_second": 8176.779053553982
+    },
+    {
+      "phase": "decode",
+      "batch": 1,
+      "context": 2048,
+      "pinned_vllm_latency_ms": 45.8149,
+      "zero_vllm_baseline_latency_ms": 43.511796875,
+      "zero_vllm_baseline_tokens_per_second": 22.982273126361203,
+      "zero_vllm_compressed_latency_ms": 44.354375,
+      "zero_vllm_compressed_tokens_per_second": 22.545690250398074
+    }
+  ],
+  "long_context_10000_512_concurrency_1": {
+    "pinned_vllm": {
+      "wall_ms": 25757.72,
+      "prefill_ms": 4812.88,
+      "decode_tokens_per_second": 22.088,
+      "generated_tokens_per_second": 19.8775
+    },
+    "zero_vllm_baseline": {
+      "wall_ms": 25083.00090301782,
+      "prefill_ms": 2082.7517568832263,
+      "decode_ms": 22999.787030741572,
+      "prefill_tokens_per_second": 4801.340326302108,
+      "decode_tokens_per_second": 22.261075692381826,
+      "generated_tokens_per_second": 20.412230656914723
+    },
+    "zero_vllm_compressed": {
+      "wall_ms": 24566.803472000174,
+      "prefill_ms": 1349.9192899325863,
+      "decode_ms": 23216.466894140467,
+      "prefill_tokens_per_second": 7407.850287478587,
+      "decode_tokens_per_second": 22.053312518849374,
+      "generated_tokens_per_second": 20.841132245126968
+    }
+  }
+}

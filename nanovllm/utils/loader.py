@@ -28,11 +28,25 @@ def load_model(model: nn.Module, path: str):
                     weight_loader(param, f.get_tensor(weight_name))
 
 
-def initialize_dummy_weights(model: nn.Module):
+def initialize_dummy_weights(model: nn.Module, seed: int = 1234):
+    torch.manual_seed(seed)
     for name, param in model.named_parameters():
         if param.dtype == torch.float4_e2m1fn_x2:
             param.data.view(torch.uint8).zero_()
         elif name.endswith("weight_scale_inv") or name.endswith("weight_global_scale"):
             param.data.fill_(1)
+        elif param.dtype == torch.float8_e4m3fn:
+            param.data.copy_(
+                torch.randn(
+                    param.shape,
+                    device=param.device,
+                    dtype=torch.bfloat16,
+                ).to(param.dtype)
+            )
+        elif param.ndim == 1 and name.endswith(".weight"):
+            param.data.fill_(1)
         else:
-            param.data.zero_()
+            param.data.normal_(
+                0,
+                1 / max(1, param.shape[-1]) ** 0.5,
+            )

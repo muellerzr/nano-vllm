@@ -1,4 +1,6 @@
 import atexit
+import os
+import uuid
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -28,6 +30,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        config.shm_name = f"nanovllm_{os.getpid()}_{uuid.uuid4().hex}"
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []

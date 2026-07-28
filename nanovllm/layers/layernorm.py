@@ -1,51 +1,17 @@
 import torch
+from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 from torch import nn
-from nanovllm.utils.compile import compile_inner
 
 
 class RMSNorm(nn.Module):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
+    def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @compile_inner
-    def rms_forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
-
-    @compile_inner
-    def add_rms_forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x, residual=None):
         if residual is None:
-            return self.rms_forward(x)
-        else:
-            return self.add_rms_forward(x, residual)
+            return rmsnorm(x, self.weight, self.eps)
+        fused_add_rmsnorm(x, residual, self.weight, self.eps)
+        return x, residual

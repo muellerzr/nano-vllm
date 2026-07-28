@@ -16,7 +16,8 @@ dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn>=2.8.3",
+    "flashinfer-python==0.6.15.post1",
+    "cuda-python>=13.0",
     "ninja",
     "xxhash",
 ]
