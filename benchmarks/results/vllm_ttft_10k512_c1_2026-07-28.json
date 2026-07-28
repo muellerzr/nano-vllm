@@ -1,0 +1,52 @@
+{
+  "protocol": {
+    "backend": "openai-chat",
+    "endpoint": "/v1/chat/completions",
+    "dataset": "random",
+    "input_tokens": 10000,
+    "output_tokens": 512,
+    "num_prompts": 1,
+    "max_concurrency": 1,
+    "seed": 1234,
+    "warmup_requests": 0,
+    "prefix_caching": false,
+    "cuda_graph_mode": "NONE",
+    "tensor_parallel_size": 4,
+    "base_image": "vllm/vllm-openai:nightly-x86_64",
+    "base_image_digest": "sha256:929e0ce173d6c2b44adabb6349ad6988710ca43ad9fd7fa82869cc55857f201d",
+    "vllm_revision": "0.23.1rc1.dev1502+g1240c74c0",
+    "vllm_source_commit": "1240c74c0a47473449cf0c3a9c2d87a1e159f73b",
+    "weights": "deterministic dummy/synthetic"
+  },
+  "bench_command": "vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --dataset-name random --random-input-len 10000 --random-output-len 512 --num-prompts 1 --max-concurrency 1 --seed 1234",
+  "results": {
+    "stock": {
+      "ttft_ms": 1942.05,
+      "tpot_ms": 46.52,
+      "itl_ms": 46.43,
+      "e2el_ms": 25715.66,
+      "output_tok_per_s": 19.91,
+      "total_tok_per_s": 408.78
+    },
+    "tuned": {
+      "ttft_ms": 1284.72,
+      "tpot_ms": 48.03,
+      "itl_ms": 47.93,
+      "e2el_ms": 25826.95,
+      "output_tok_per_s": 19.82,
+      "total_tok_per_s": 407.01
+    }
+  },
+  "stock_server": {
+    "compilation_passes": ["enable_qk_norm_rope_fusion"],
+    "fp8_all_reduce": false,
+    "fp8_all_reduce_min_bytes": 3145728,
+    "fuse_allreduce_rms": false
+  },
+  "tuned_server": {
+    "compilation_passes": ["enable_qk_norm_rope_fusion", "fuse_allreduce_rms"],
+    "fp8_all_reduce": true,
+    "fp8_all_reduce_min_bytes": 3145728,
+    "fuse_allreduce_rms": true
+  }
+}
