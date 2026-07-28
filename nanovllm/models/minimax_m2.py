@@ -12,46 +12,38 @@ from nanovllm.layers.router import topk_sigmoid
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
+
 class MiniMaxM2Attention(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
-        self.total_num_heads = config.num_attention_heads
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        self.num_heads = config.num_attention_heads // tp_size
+        self.num_kv_heads = config.num_key_value_heads // tp_size
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            config.num_attention_heads,
+            config.num_key_value_heads,
             bias=False,
         )
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
+            config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=False,
         )
         self.q_norm = RMSNorm(self.q_size, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.kv_size, eps=config.rms_norm_eps)
-        rope_params = getattr(config, "rope_parameters", {}) or {}
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=config.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=getattr(config, "rope_theta", rope_params.get("rope_theta", 10000)),
+            base=config.rope_theta,
         )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-        )
+        self.attn = Attention()
 
     def forward(
         self,
@@ -94,53 +86,47 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         self.num_experts = config.num_local_experts
         self.gate = RouterLinear(config.hidden_size, self.num_experts)
         tp_size = dist.get_world_size()
+        self.tp_size = tp_size
+        self.tp_rank = dist.get_rank()
         self.w1_w3 = NVFP4GroupedLinear(self.num_experts, config.hidden_size, config.intermediate_size * 2 // tp_size)
         self.w2 = NVFP4GroupedLinear(self.num_experts, config.intermediate_size // tp_size, config.hidden_size)
-        self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts))
         self._flashinfer_moe = flashinfer.fused_moe.cutlass_fused_moe
-        self._topk_buffers = None
-
-    def _flashinfer_forward(self, hidden_states, top_k_index, top_k_weights):
-        w1, w2 = self.w1_w3, self.w2
-        if not hasattr(self, "_flashinfer_quant_scales"):
-            self._flashinfer_quant_scales = [
-                w1.input_global_scale.expand(self.num_experts),
-                w1.weight_scale_inv.view(torch.int32),
-                w1.weight_global_scale,
-                w2.input_global_scale.expand(self.num_experts),
-                w2.weight_scale_inv.view(torch.int32),
-                w2.weight_global_scale,
-            ]
-        top_k_index = top_k_index.to(torch.int32).contiguous()
-        top_k_weights = top_k_weights.contiguous()
-        w1_packed = w1.weight.view(torch.long)
-        w2_packed = w2.weight.view(torch.long)
-        output = self._flashinfer_moe(
-            input=hidden_states,
-            token_selected_experts=top_k_index,
-            token_final_scales=top_k_weights,
-            fc1_expert_weights=w1_packed,
-            fc2_expert_weights=w2_packed,
-            output_dtype=hidden_states.dtype,
-            quant_scales=self._flashinfer_quant_scales,
-            tp_size=dist.get_world_size(),
-            tp_rank=dist.get_rank(),
-            output=torch.empty_like(hidden_states),
-            use_fused_finalize=True,
-        )
-        return output[0] if isinstance(output, (tuple, list)) else output
+        self._flashinfer_quant_scales = [
+            self.w1_w3.input_global_scale.expand(self.num_experts),
+            self.w1_w3.weight_scale_inv.view(torch.int32),
+            self.w1_w3.weight_global_scale,
+            self.w2.input_global_scale.expand(self.num_experts),
+            self.w2.weight_scale_inv.view(torch.int32),
+            self.w2.weight_global_scale,
+        ]
+        self._w1_packed = self.w1_w3.weight.view(torch.long)
+        self._w2_packed = self.w2.weight.view(torch.long)
+        self.workspace = None
 
     def forward(self, hidden_states):
         router_logits = self.gate(hidden_states)
         shape = (hidden_states.shape[0], self.top_k)
-        if self._topk_buffers is None or self._topk_buffers[0].shape != shape:
-            self._topk_buffers = (
+        if self.workspace is None or self.workspace[0].shape != shape:
+            self.workspace = (
                 torch.empty(shape, dtype=torch.float32, device=hidden_states.device),
                 torch.empty(shape, dtype=torch.int32, device=hidden_states.device),
+                torch.empty_like(hidden_states),
             )
-        top_k_weights, top_k_index = self._topk_buffers
+        top_k_weights, top_k_index, output = self.workspace
         topk_sigmoid(router_logits, top_k_weights, top_k_index)
-        output = self._flashinfer_forward(hidden_states, top_k_index, top_k_weights)
+        output = self._flashinfer_moe(
+            input=hidden_states,
+            token_selected_experts=top_k_index,
+            token_final_scales=top_k_weights,
+            fc1_expert_weights=self._w1_packed,
+            fc2_expert_weights=self._w2_packed,
+            output_dtype=hidden_states.dtype,
+            quant_scales=self._flashinfer_quant_scales,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            output=output,
+            use_fused_finalize=True,
+        )[0]
         return all_reduce(output)
 
 

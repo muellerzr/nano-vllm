@@ -3,12 +3,12 @@
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
 import platform
 import socket
-import subprocess
 from time import perf_counter
 from pathlib import Path
 
@@ -20,6 +20,7 @@ from nanovllm.layers.compressed_collective import (
     all_reduce,
     configure,
     reset_stats,
+    shutdown,
     stats,
 )
 from nanovllm.layers.attention import (
@@ -45,10 +46,18 @@ def rank_max(value: float) -> float:
 
 def source_revision() -> str:
     root = Path(__file__).resolve().parents[1]
-    try:
-        return subprocess.check_output(("git", "rev-parse", "HEAD"), cwd=root, text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "container-source"
+    paths = [
+        root / "pyproject.toml",
+        root / "setup.py",
+        Path(__file__).resolve(),
+        *sorted((root / "csrc").glob("*.cu")),
+        *sorted((root / "nanovllm").rglob("*.py")),
+    ]
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return f"sha256:{digest.hexdigest()}"
 
 
 def runtime_metadata(args, compressed: bool) -> dict:
@@ -70,9 +79,6 @@ def seed_weights(model: torch.nn.Module, seed: int) -> None:
             if name.endswith("weight_scale_inv"):
                 parameter.fill_(1)
             elif getattr(torch, "float4_e2m1fn_x2", None) is not None and parameter.dtype == torch.float4_e2m1fn_x2:
-                # PyTorch's Float4 storage has no normal-kernel.  Zero is a
-                # deterministic representable synthetic expert weight and
-                # keeps this harness independent of real checkpoints.
                 parameter.view(torch.uint8).zero_()
             elif parameter.dtype == torch.float8_e4m3fn:
                 parameter.copy_(torch.randn(parameter.shape, device="cuda", dtype=torch.bfloat16).to(parameter.dtype))
@@ -289,6 +295,9 @@ def validate_stock_collective_backends(rank: int) -> dict:
     dist.all_reduce(reference)
     configure(False)
     candidate = all_reduce(source.clone())
+    shutdown()
+    configure(False)
+    second = all_reduce(source.clone())
     exact = torch.tensor(
         int(torch.equal(reference, candidate)),
         device="cuda",
@@ -298,7 +307,17 @@ def validate_stock_collective_backends(rank: int) -> dict:
     max_abs = rank_max(
         float((candidate.float() - reference.float()).abs().max())
     )
-    return {"exact": bool(exact.item()), "max_abs_error": max_abs}
+    reinitialized_exact = torch.tensor(
+        int(torch.equal(reference, second)),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    dist.all_reduce(reinitialized_exact, op=dist.ReduceOp.MIN)
+    return {
+        "exact": bool(exact.item()),
+        "max_abs_error": max_abs,
+        "reinitialized_exact": bool(reinitialized_exact.item()),
+    }
 
 
 def parse_args():
@@ -331,8 +350,6 @@ def make_prompt(length: int, vocab_size: int) -> list[int]:
 
 def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: int, vocab_size: int) -> dict:
     def once(salt: int):
-        # Prefix caching is disabled in the vLLM protocol.  Nano's block
-        # manager hashes blocks, so every sample gets a distinct first block.
         run_prompts = [[(token + salt) % vocab_size for token in prompt] for prompt in prompts]
         for prompt in run_prompts:
             llm.add_request(prompt, sampling_params)

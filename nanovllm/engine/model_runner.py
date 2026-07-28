@@ -10,10 +10,11 @@ from nanovllm.models.minimax_m2 import MiniMaxM2ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, reset_context
 from nanovllm.layers.attention import (
+    Attention,
     make_flashinfer_decode_state,
     make_flashinfer_prefill_state,
 )
-from nanovllm.layers.compressed_collective import configure
+from nanovllm.layers.compressed_collective import configure, shutdown
 from nanovllm.layers.minimax_rms_norm import reset_qk_norm
 from nanovllm.utils.loader import load_model, initialize_dummy_weights
 
@@ -79,6 +80,7 @@ class ModelRunner:
                 self.shm.unlink()
         torch.cuda.synchronize()
         reset_qk_norm()
+        shutdown()
         dist.destroy_process_group()
 
     def loop(self):
@@ -147,7 +149,7 @@ class ModelRunner:
         )
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            if isinstance(module, Attention):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1

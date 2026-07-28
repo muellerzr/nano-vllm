@@ -10,21 +10,13 @@ class UniqueId(ctypes.Structure):
 
 
 DTYPES = {
-    torch.uint8: 1,
-    torch.int32: 2,
-    torch.int64: 4,
-    torch.float16: 6,
     torch.float32: 7,
-    torch.float64: 8,
     torch.bfloat16: 9,
     torch.float8_e4m3fn: 10,
 }
 OPS = {
     dist.ReduceOp.SUM: 0,
-    dist.ReduceOp.PRODUCT: 1,
     dist.ReduceOp.MAX: 2,
-    dist.ReduceOp.MIN: 3,
-    dist.ReduceOp.AVG: 4,
 }
 
 
@@ -61,6 +53,7 @@ class NcclCommunicator:
             ctypes.c_void_p,
             ctypes.c_void_p,
         ]
+        self.lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
         unique_id = UniqueId()
         if self.rank == 0:
             self._call(self.lib.ncclGetUniqueId(ctypes.byref(unique_id)))
@@ -120,3 +113,8 @@ class NcclCommunicator:
             )
         )
         return output
+
+    def close(self):
+        torch.cuda.current_stream(self.device).synchronize()
+        self._call(self.lib.ncclCommDestroy(self.comm))
+        self.comm = None

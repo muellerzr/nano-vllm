@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "nano-vllm"
 version = "0.2.0"
 authors = [{ name = "Xingkai Yu" }]
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "A fixed-target MiniMax M2 inference engine for four SM120 GPUs"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "cuda-toolkit[cccl,nvcc]==13.0.3.0",
@@ -19,14 +19,10 @@ dependencies = [
     "flashinfer-python==0.6.15.post1",
     "cuda-python>=13.0",
     "ninja",
-    "xxhash",
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
-
-[tool.uv]
-no-build-isolation-package = ["flash-attn"]
+Homepage = "https://github.com/muellerzr/nano-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]

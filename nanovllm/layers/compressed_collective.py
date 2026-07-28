@@ -58,6 +58,16 @@ def reset_stats():
         _STATS[key] = 0
 
 
+def shutdown():
+    global _COMM, _GROUP
+    if _COMM is None:
+        return
+    _COMM.close()
+    dist.destroy_process_group(_GROUP)
+    _COMM = None
+    _GROUP = None
+
+
 def stats():
     return {**_STATS, "min_bytes": _MIN_BYTES, "block_size": BLOCK}
 

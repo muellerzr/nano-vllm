@@ -11,7 +11,7 @@ The deployment environment must provide PyTorch with CUDA, Triton, FlashInfer,
 NCCL, Transformers, safetensors, and the CUDA toolkit.
 
 ```bash
-TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation .
+TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation --no-deps .
 ```
 
 ```python

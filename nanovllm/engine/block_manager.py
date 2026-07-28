@@ -1,10 +1,7 @@
+from array import array
 from collections import deque
 import hashlib
-try:
-    import xxhash
-except ImportError:
-    xxhash = None
-import numpy as np
+
 
 from nanovllm.engine.sequence import Sequence
 
@@ -38,10 +35,11 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        payload = (prefix.to_bytes(8, "little") if prefix != -1 else b"") + np.array(token_ids).tobytes()
-        if xxhash is not None:
-            return xxhash.xxh64(payload).intdigest()
-        return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+        payload = (prefix.to_bytes(8, "little") if prefix != -1 else b"") + array("q", token_ids).tobytes()
+        return int.from_bytes(
+            hashlib.blake2b(payload, digest_size=8).digest(),
+            "little",
+        )
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()

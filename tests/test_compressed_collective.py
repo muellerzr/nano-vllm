@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -10,6 +10,8 @@ class CompressedCollectiveTest(unittest.TestCase):
 
     def tearDown(self):
         collective.configure()
+        collective._COMM = None
+        collective._GROUP = None
 
     def test_disabled_is_default(self):
         collective.configure()
@@ -44,3 +46,15 @@ class CompressedCollectiveTest(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+    def test_shutdown_releases_communicator_and_group(self):
+        communicator = Mock()
+        group = object()
+        collective._COMM = communicator
+        collective._GROUP = group
+        with patch.object(collective.dist, "destroy_process_group") as destroy:
+            collective.shutdown()
+        communicator.close.assert_called_once_with()
+        destroy.assert_called_once_with(group)
+        self.assertIsNone(collective._COMM)
+        self.assertIsNone(collective._GROUP)

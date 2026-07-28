@@ -22,8 +22,8 @@ class _FlashInferDecodeState:
     def __init__(self, wrapper):
         self.wrapper = wrapper
 
-    def run(self, q, k_cache, v_cache, out=None):
-        return self.wrapper.run(q, (k_cache, v_cache), out=out)
+    def run(self, q, k_cache, v_cache):
+        return self.wrapper.run(q, (k_cache, v_cache))
 
 
 class _FlashInferPrefillState:
@@ -32,10 +32,10 @@ class _FlashInferPrefillState:
         self.wrapper = wrapper
         self.paged = paged
 
-    def run(self, q, k, v, out=None):
+    def run(self, q, k, v):
         if self.paged:
-            return self.wrapper.run(q, (k, v), out=out)
-        return self.wrapper.run(q, k, v, out=out)
+            return self.wrapper.run(q, (k, v))
+        return self.wrapper.run(q, k, v)
 
 
 def _paged_layout(block_tables: torch.Tensor, lengths: torch.Tensor, page_size: int):
@@ -84,7 +84,7 @@ def make_flashinfer_decode_state(
 def make_flashinfer_prefill_state(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    block_tables: torch.Tensor,
+    block_tables: torch.Tensor | None,
     *,
     num_heads: int,
     num_kv_heads: int,
@@ -171,18 +171,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 class Attention(nn.Module):
 
-    def __init__(
-        self,
-        num_heads,
-        head_dim,
-        scale,
-        num_kv_heads,
-    ):
+    def __init__(self):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = scale
-        self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
