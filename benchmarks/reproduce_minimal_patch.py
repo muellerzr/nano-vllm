@@ -386,7 +386,7 @@ def measure_generation(llm, prompts, sampling_params, warmup: int, iterations: i
         "prefill_tokens": prompt_tokens,
         "decode_tokens": generated_tokens,
         "prefill_tokens_per_second": prompt_tokens / prefill_s,
-        "decode_tokens_per_second": generated_tokens / decode_s,
+        "decode_tokens_per_second": generated_tokens / decode_s if decode_s else None,
         "generated_tokens_per_second": generated_tokens / wall,
         "generated_tokens_per_second_per_user": generated_tokens / len(prompts) / wall,
     }
