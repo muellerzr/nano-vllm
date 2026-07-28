@@ -2,9 +2,138 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
+import flashinfer
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+
+_FLASHINFER_WORKSPACES = {}
+
+
+def _flashinfer_workspace(device):
+    workspace = _FLASHINFER_WORKSPACES.get(device)
+    if workspace is None:
+        workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+        _FLASHINFER_WORKSPACES[device] = workspace
+    return workspace
+
+
+class _FlashInferDecodeState:
+
+    def __init__(self, wrapper):
+        self.wrapper = wrapper
+
+    def run(self, q, k_cache, v_cache):
+        return self.wrapper.run(q, (k_cache, v_cache))
+
+
+class _FlashInferPrefillState:
+
+    def __init__(self, wrapper, paged: bool):
+        self.wrapper = wrapper
+        self.paged = paged
+
+    def run(self, q, k, v):
+        if self.paged:
+            return self.wrapper.run(q, (k, v))
+        return self.wrapper.run(q, k, v)
+
+
+def _paged_layout(block_tables: torch.Tensor, lengths: torch.Tensor, page_size: int):
+    pages = (lengths + page_size - 1) // page_size
+    max_pages = block_tables.shape[1]
+    page_numbers = torch.arange(max_pages, device=block_tables.device, dtype=torch.int32)
+    mask = page_numbers.unsqueeze(0) < pages.unsqueeze(1)
+    indices = block_tables.masked_select(mask).to(torch.int32)
+    indptr = torch.cat((torch.zeros(1, dtype=torch.int32, device=pages.device), torch.cumsum(pages, 0, dtype=torch.int32)))
+    last_page_len = (lengths - 1).remainder(page_size).add(1).to(torch.int32)
+    return indptr, indices, last_page_len
+
+
+def make_flashinfer_decode_state(
+    block_tables: torch.Tensor | None,
+    context_lens: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    scale: float,
+):
+    indptr, indices, last_page_len = _paged_layout(block_tables, context_lens, page_size)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        _flashinfer_workspace(block_tables.device), kv_layout="NHD", use_tensor_cores=True
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        o_data_type=q_dtype,
+        sm_scale=scale,
+    )
+    return _FlashInferDecodeState(wrapper)
+
+
+def make_flashinfer_prefill_state(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_tables: torch.Tensor | None,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    scale: float,
+):
+    if block_tables is None:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            _flashinfer_workspace(cu_seqlens_q.device), kv_layout="NHD"
+        )
+        wrapper.plan(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            head_dim,
+            causal=True,
+            sm_scale=scale,
+            q_data_type=q_dtype,
+            kv_data_type=q_dtype,
+            o_data_type=q_dtype,
+        )
+        return _FlashInferPrefillState(wrapper, paged=False)
+    k_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    paged_indptr, paged_indices, last_page_len = _paged_layout(block_tables, k_lengths, page_size)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        _flashinfer_workspace(block_tables.device), kv_layout="NHD"
+    )
+    wrapper.plan(
+        cu_seqlens_q,
+        paged_indptr,
+        paged_indices,
+        last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        head_dim,
+        causal=True,
+        sm_scale=scale,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        o_data_type=q_dtype,
+    )
+    return _FlashInferPrefillState(wrapper, paged=True)
 
 
 @triton.jit
@@ -42,18 +171,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 class Attention(nn.Module):
 
-    def __init__(
-        self,
-        num_heads,
-        head_dim,
-        scale,
-        num_kv_heads,
-    ):
+    def __init__(self):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = scale
-        self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -62,14 +181,13 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            if context.flashinfer_prefill is None:
+                raise RuntimeError("prefill FlashInfer state was not prepared")
+            if context.block_tables is not None:
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            o = context.flashinfer_prefill.run(q, k, v)
+        else:
+            if context.flashinfer_decode is None:
+                raise RuntimeError("decode FlashInfer state was not prepared")
+            o = context.flashinfer_decode.run(q, k_cache, v_cache)
         return o

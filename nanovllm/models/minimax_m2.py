@@ -1,11 +1,14 @@
 import torch
 from torch import nn
 import torch.distributed as dist
+import flashinfer
 
-from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
+from nanovllm.layers.compressed_collective import all_reduce
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import FP8QKVParallelLinear, FP8MergedColumnParallelLinear, FP8RowParallelLinear, ReplicatedLinear
+from nanovllm.layers.linear import NVFP4GroupedLinear, QKVParallelLinear, RouterLinear, RowParallelLinear
+from nanovllm.layers.minimax_rms_norm import qk_rms_norm
+from nanovllm.layers.router import topk_sigmoid
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -15,23 +18,20 @@ class MiniMaxM2Attention(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
-        self.total_num_heads = config.num_attention_heads
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        self.num_heads = config.num_attention_heads // tp_size
+        self.num_kv_heads = config.num_key_value_heads // tp_size
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
-        self.qkv_proj = FP8QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            config.num_attention_heads,
+            config.num_key_value_heads,
             bias=False,
         )
-        self.o_proj = FP8RowParallelLinear(
-            self.total_num_heads * self.head_dim,
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=False,
         )
@@ -43,12 +43,7 @@ class MiniMaxM2Attention(nn.Module):
             max_position=config.max_position_embeddings,
             base=config.rope_theta,
         )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-        )
+        self.attn = Attention()
 
     def forward(
         self,
@@ -56,33 +51,31 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q).view(-1, self.num_heads, self.head_dim)
-        k = self.k_norm(k).view(-1, self.num_kv_heads, self.head_dim)
+        q, k = qk_rms_norm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_size,
+            self.kv_size,
+            self.q_norm.eps,
+        )
+        _, _, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        q, k = self.rotary_emb(positions, q, k)
+        cache = self.rotary_emb.cos_sin_cache
+        if cache.ndim == 3:
+            cache = cache[:, 0]
+        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(
+            positions,
+            q,
+            k,
+            self.head_dim,
+            cache,
+            True,
+        )
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
         o = self.attn(q, k, v)
         return self.o_proj(o.flatten(1, -1))
-
-
-class MiniMaxM2MLP(nn.Module):
-
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.w1_w3 = FP8MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size] * 2,
-            bias=False,
-        )
-        self.w2 = FP8RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        return self.w2(self.act_fn(self.w1_w3(x)))
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):
@@ -91,24 +84,50 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
-        self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([MiniMaxM2MLP(config) for _ in range(self.num_experts)])
-        self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts))
+        self.gate = RouterLinear(config.hidden_size, self.num_experts)
+        tp_size = dist.get_world_size()
+        self.tp_size = tp_size
+        self.tp_rank = dist.get_rank()
+        self.w1_w3 = NVFP4GroupedLinear(self.num_experts, config.hidden_size, config.intermediate_size * 2 // tp_size)
+        self.w2 = NVFP4GroupedLinear(self.num_experts, config.intermediate_size // tp_size, config.hidden_size)
+        self._flashinfer_moe = flashinfer.fused_moe.cutlass_fused_moe
+        self._flashinfer_quant_scales = [
+            self.w1_w3.input_global_scale.expand(self.num_experts),
+            self.w1_w3.weight_scale_inv.view(torch.int32),
+            self.w1_w3.weight_global_scale,
+            self.w2.input_global_scale.expand(self.num_experts),
+            self.w2.weight_scale_inv.view(torch.int32),
+            self.w2.weight_global_scale,
+        ]
+        self._w1_packed = self.w1_w3.weight.view(torch.long)
+        self._w2_packed = self.w2.weight.view(torch.long)
+        self.workspace = None
 
     def forward(self, hidden_states):
         router_logits = self.gate(hidden_states)
-        routing_weights = torch.sigmoid(router_logits.float())
-        scores = routing_weights + self.e_score_correction_bias
-        top_k_index = torch.topk(scores, self.top_k, dim=-1, sorted=False).indices
-        top_k_weights = routing_weights.gather(1, top_k_index)
-        top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
-        output = torch.zeros_like(hidden_states)
-        for expert_idx in top_k_index.unique():
-            token_idx, slot_idx = torch.where(top_k_index == expert_idx)
-            x = hidden_states[token_idx]
-            y = self.experts[expert_idx](x)
-            output.index_add_(0, token_idx, y * top_k_weights[token_idx, slot_idx, None].to(y.dtype))
-        return output
+        shape = (hidden_states.shape[0], self.top_k)
+        if self.workspace is None or self.workspace[0].shape != shape:
+            self.workspace = (
+                torch.empty(shape, dtype=torch.float32, device=hidden_states.device),
+                torch.empty(shape, dtype=torch.int32, device=hidden_states.device),
+                torch.empty_like(hidden_states),
+            )
+        top_k_weights, top_k_index, output = self.workspace
+        topk_sigmoid(router_logits, top_k_weights, top_k_index)
+        output = self._flashinfer_moe(
+            input=hidden_states,
+            token_selected_experts=top_k_index,
+            token_final_scales=top_k_weights,
+            fc1_expert_weights=self._w1_packed,
+            fc2_expert_weights=self._w2_packed,
+            output_dtype=hidden_states.dtype,
+            quant_scales=self._flashinfer_quant_scales,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            output=output,
+            use_fused_finalize=True,
+        )[0]
+        return all_reduce(output)
 
 
 class MiniMaxM2DecoderLayer(nn.Module):
