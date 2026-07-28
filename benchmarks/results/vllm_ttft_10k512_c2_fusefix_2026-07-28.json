@@ -1,0 +1,45 @@
+{
+  "protocol": {
+    "backend": "openai-chat",
+    "endpoint": "/v1/chat/completions",
+    "dataset": "random",
+    "input_tokens": 10000,
+    "output_tokens": 512,
+    "num_prompts": 2,
+    "max_concurrency": 2,
+    "seed": 1234,
+    "prefix_caching": false,
+    "cuda_graph_mode": "NONE",
+    "tensor_parallel_size": 4,
+    "weights": "deterministic dummy/synthetic"
+  },
+  "server_route": {
+    "command_pass_config": {
+      "mode": 3,
+      "cudagraph_mode": "NONE",
+      "pass_config": {
+        "enable_qk_norm_rope_fusion": true,
+        "fuse_allreduce_rms": true
+      }
+    },
+    "startup_confirmation": "Enabled custom fusions: act_quant, allreduce_rms, qk_norm_rope_fusion",
+    "fp8_all_reduce": true,
+    "fp8_all_reduce_min_bytes": 3145728
+  },
+  "comparison": {
+    "stock": {
+      "mean_ttft_ms": 2840.393553,
+      "mean_tpot_ms": 49.275714,
+      "mean_e2el_ms": 28020.2835215,
+      "output_throughput": 36.501800,
+      "total_token_throughput": 749.4275909
+    },
+    "fixed_tuned": {
+      "mean_ttft_ms": 1913.571081,
+      "mean_tpot_ms": 48.502740,
+      "mean_e2el_ms": 26698.471205,
+      "output_throughput": 38.277021,
+      "total_token_throughput": 785.8750879
+    }
+  }
+}
